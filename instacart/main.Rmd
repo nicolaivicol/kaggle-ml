@@ -1,0 +1,1180 @@
+---
+title: "insta_main"
+output: html_document
+---
+
+libs
+```{r libs}
+library(data.table)
+library(zoo)
+library(Matrix)
+library(xgboost)
+library(ggplot2)
+```
+\
+udf   
+```{r udf}
+source("E:/kaggle/udf.R")
+gc()
+udf_memorycheck()
+udf_getdataXGB <- function(fold_train, y, Xs) {
+  if (exists("dta_xgb.train", envir = globalenv())) { rm(dta_xgb.train, envir = globalenv()) }
+  dta_xgb.train <<- xgb.DMatrix(data = as.matrix(dta_train[eval_set=="train" & fold==fold_train, Xs, with = F]), 
+                             label = as.matrix(dta_train[eval_set=="train" & fold==fold_train, y, with = F]), 
+                             missing = NaN)
+  if (exists("dta_xgb.valid", envir = globalenv())) { rm(dta_xgb.valid, envir = globalenv()) }
+  gc(verbose = F)
+  dta_xgb.valid <<- xgb.DMatrix(data = as.matrix(dta_train[eval_set=="train" & fold != fold_train & fold != 0, Xs, with = F]), 
+                             label = as.matrix(dta_train[eval_set=="train" & fold != fold_train & fold != 0, y, with = F]), 
+                             missing = NaN)
+  if (exists("dta_xgb.test", envir = globalenv())) { rm(dta_xgb.test, envir = globalenv()) }
+  gc(verbose = F)
+  dta_xgb.test <<- xgb.DMatrix(data = as.matrix(dta_train[eval_set == "test", Xs, with = F]), 
+                             label = as.matrix(dta_train[eval_set == "test", y, with = F]), 
+                             missing = NaN)
+  gc(verbose = F)
+}
+```
+\
+dirs
+```{r dirs}
+dir_proj <- "C:/kaggle/instacart/"
+dir_data.raw <- paste0(dir_proj, "data.raw/")
+dir_data <- paste0(dir_proj, "data/")
+dir_out.reduced <- paste0(dir_proj, "reduced/") 
+dir_out.res <- paste0(dir_proj, "results/")
+dir_out.models <- paste0(dir_proj, "models/")
+dir_out.submits <- paste0(dir_proj, "submits/")
+```
+\
+data
+```{r data}
+dta_aisles <- fread(paste0(dir_data, "aisles.csv"))
+dta_dpts <- fread(paste0(dir_data, "departments.csv"))
+dta_products <- fread(paste0(dir_data, "products.csv"))
+
+dta_orders <- fread(paste0(dir_data, "orders.csv"))
+dta_ord_prod_prior <- fread(paste0(dir_data, "order_products__prior.csv"))
+dta_ord_prod_train <- fread(paste0(dir_data, "order_products__train.csv"))
+```
+\
+# Create feats - aggregate
+```{r}
+# in train to add all previous product id, if appears in train - 1, if not 0, reorder=0 should be removed
+
+dta <- merge(dta_orders[eval_set == "prior", ], dta_ord_prod_prior, by = "order_id", all = T)
+dta <- merge(dta, dta_products[, c("product_id", "aisle_id", "department_id"), with=F], by = "product_id", all.x = T)
+dta[, sum(is.na(product_id)), by = eval_set]
+dta
+
+mx_N_orders <- dta[eval_set == "prior", uniqueN(order_id)] 
+mx_N_users <- dta[eval_set == "prior", uniqueN(user_id)] 
+
+# USER
+# user: how many distinct products purchased
+dta_agg_user <- dta[, list(f_u_Nproduniq = uniqueN(product_id),
+                       f_u_Nprod = length(product_id),
+                       f_u_Nords = uniqueN(order_id),
+                       f_u_NordsMax = max(order_number),
+                       f_u_reord = mean(reordered), 
+                       f_u_Ndpt = uniqueN(department_id),
+                       f_u_Nais = uniqueN(aisle_id)), 
+                by = list(user_id)]
+dta_agg_user
+
+# user: time freq of purchase
+dta_agg <- dta_orders[eval_set == "prior", 
+                      list(f_u_dayssince_m = mean(days_since_prior_order, na.rm=T),
+                           #f_u_dayssince_q50 = median(days_since_prior_order, na.rm=T),
+                           #f_u_dayssince_sd = sd(days_since_prior_order, na.rm=T),
+                           f_u_daystotal = sum(days_since_prior_order, na.rm=T)), 
+                      by = list(user_id)]
+dta_agg
+#hist(dta_agg$f_u_dayssince_m, n = 100, main = "user: avg days between purchases")
+dta_agg_user <- merge(dta_agg_user, dta_agg, by = "user_id")
+
+# user: how many products per order, how many orders
+dta_agg <- dta[, list(NpOrd = .N,
+                      NrepOrd = sum(reordered),
+                      reordpOrd = mean(reordered), 
+                      order_number = max(order_number)), 
+               by = list(user_id, order_id)]
+dta_agg[, max_order_number := max(order_number), by = user_id]
+setorder(dta_agg, user_id, order_number)
+#head(dta_agg, 25)
+dta_agg1 <- dta_agg[, list(f_u_NpOrd_m = mean(NpOrd),
+                          f_u_NpOrd_sd = sd(NpOrd),
+                          #f_u_NpOrd_q10 = quantile(NpOrd, 0.1),
+                          f_u_NpOrd_q50 = quantile(NpOrd, 0.5),
+                          #f_u_NpOrd_q90 = quantile(NpOrd, 0.9),
+                          f_u_NrepOrd_q25 = quantile(NrepOrd, 0.25),
+                          f_u_NrepOrd_q50 = quantile(NrepOrd, 0.50),
+                          #f_u_NrepOrd_q75 = quantile(NrepOrd, 0.75),
+                          f_u_NrepOrd_q90 = quantile(NrepOrd, 0.90),
+                          f_u_NrepOrd_m = mean(NrepOrd),
+                          f_u_reordpOrd_sd = sd(reordpOrd),
+                          f_u_reordpOrd_m = mean(reordpOrd)), 
+                   by = list(user_id)]
+hist(dta_agg1$f_u_NpOrd_m, n = 100, main = "user: items per order")
+hist(dta_agg1$f_u_NrepOrd_q50, n = 200, main = "user: reord items per order")
+dta_agg_user <- merge(dta_agg_user, dta_agg1, by = "user_id")
+
+dta_agg2 <- dta_agg[order_number >= (max_order_number - 4), 
+                    list(f_u_NpOrd_m_p50 = mean(NpOrd),
+                          #f_u_NpOrd_sd = sd(NpOrd),
+                          #f_u_NpOrd_q10 = quantile(NpOrd, 0.1),
+                          #f_u_NpOrd_q50 = quantile(NpOrd, 0.5),
+                          #f_u_NpOrd_q90 = quantile(NpOrd, 0.9),
+                          f_u_NrepOrd_q25_p50 = quantile(NrepOrd, 0.25),
+                          f_u_NrepOrd_q50_p50 = quantile(NrepOrd, 0.50),
+                          #f_u_NrepOrd_q75 = quantile(NrepOrd, 0.75),
+                          f_u_NrepOrd_q90_p50 = quantile(NrepOrd, 0.90),
+                          f_u_NrepOrd_m_p50 = mean(NrepOrd),
+                          f_u_reordpOrd_sd_p50 = sd(reordpOrd),
+                          f_u_reordpOrd_m_p50 = mean(reordpOrd)), 
+                   by = list(user_id)]
+dta_agg_user <- merge(dta_agg_user, dta_agg2, by = "user_id")
+rm(dta_agg1, dta_agg2)
+
+# USER-PRODUCT
+# user: order of product in basket (abs, norm) of client
+# dta <- fread(paste0(dir_data, "dta.csv"))
+dta[, NpOrd := .N, by = list(order_id)]
+dta[, add_to_cart_order_norm := add_to_cart_order/NpOrd]
+
+setorder(dta, user_id, order_number, order_id)
+
+dta_agg_userprod <- dta[, list(f_up_period = mean(diff(order_number)),
+                               f_up_N = .N), 
+                    keyby = list(user_id, product_id)]
+
+dta_agg_userprod <- dta[, list(f_up_reorder = mean(reordered), 
+                               f_up_cartorder_m = mean(add_to_cart_order), 
+                               f_up_cartordernorm_m = mean(add_to_cart_order_norm),
+                               f_up_ordnum_first = min(order_number),
+                               f_up_ordnum_last = max(order_number),
+                               f_up_days_since_prior_order_m = mean(days_since_prior_order, na.rm = T),
+                               #f_up_days_since_prior_order_sd = sd(days_since_prior_order),
+                               f_up_period = mean(diff(order_number)),
+                               f_up_N = .N), 
+                    keyby = list(user_id, product_id)]
+
+dta[, u_Nord := max(order_number), by = user_id]
+dta_agg <- dta[, list(f_up_reord_last4=sum(order_number>=(u_Nord-3))/4,
+                      f_up_reord_last3=sum(order_number>=(u_Nord-2))/3,
+                      f_up_reord_last2=sum(order_number>=(u_Nord-1))/2,
+                      f_up_reord_last10=sum(order_number>=(u_Nord-9))/10,
+                      f_up_reord_last20=sum(order_number>=(u_Nord-19))/20,
+                      f_up_reord_last30=sum(order_number>=(u_Nord-29))/30,
+                      f_up_reord_last50=sum(order_number>=(u_Nord-49))/50,
+                      #f_up_reord_last1=sum(order_number>=(u_Nord))/1, 
+                      f_up_reord_last25p=sum(order_number>=(u_Nord-ceiling(0.25*u_Nord)))/ceiling(0.25*max(u_Nord)+1), 
+                      f_up_reord_last50p=sum(order_number>=(u_Nord-ceiling(0.50*u_Nord)))/ceiling(0.50*max(u_Nord)+1)),
+               keyby = list(user_id, product_id)]
+dta_agg_userprod <- merge(dta_agg_userprod, dta_agg, keyby = c("user_id", "product_id"), all.x = T)
+dta[, u_Nord := NULL]
+rm(dta_agg); gc()
+#summary(dta_agg_userprod)
+
+# USER-DEPARTMENT(PRODUCT)
+dta_agg_userdpt <- dta[, list(f_ud_reorder = mean(reordered), 
+                              #f_ud_cartorder_m = mean(add_to_cart_order), 
+                              f_ud_cartordernorm_m = mean(add_to_cart_order_norm)), 
+                       keyby = list(user_id, department_id)]
+dta[, ud_Nord := NULL]
+dta_agg <- dta[, list(ud_Nord = max(order_number)), keyby = c("user_id", "department_id")]
+dta <- merge(dta, dta_agg, by = c("user_id", "department_id"))
+gc()
+
+dta[, misc := NULL]
+dta[, misc := min(order_number), by = list(user_id, department_id)]
+dta_agg <- dta[order_number>=misc, list(f_ud_reord_sincefirst=mean(reordered)), 
+               keyby = list(user_id, department_id)]
+dta_agg_userdpt <- merge(dta_agg_userdpt, dta_agg, keyby = c("user_id", "department_id"), all.x = T)
+
+dta_agg <- dta[order_number>(ud_Nord-10), list(f_ud_reord_last10=mean(reordered)), 
+               keyby = list(user_id, department_id)]
+dta_agg_userdpt <- merge(dta_agg_userdpt, dta_agg, keyby = c("user_id", "department_id"), all.x = T)
+dta_agg <- dta[order_number>(ud_Nord-25), list(f_ud_reord_last25=mean(reordered)), 
+               keyby = list(user_id, department_id)]
+dta_agg_userdpt <- merge(dta_agg_userdpt, dta_agg, keyby = c("user_id", "department_id"), all.x = T)
+
+dta[, misc := NULL]
+dta[, misc := ceiling(0.25*max(ud_Nord)+1), by = list(user_id, department_id)]
+dta_agg <- dta[order_number>=misc, list(f_ud_reord_last25p=mean(reordered, na.rm =T)), 
+               keyby = list(user_id, department_id)]
+dta_agg_userdpt <- merge(dta_agg_userdpt, dta_agg, keyby = c("user_id", "department_id"), all.x = T)
+dta_agg_userdpt[is.na(f_ud_reord_last25p), f_ud_reord_last25p := 0]
+dta[, misc := NULL]
+dta[, ud_Nord := NULL]
+#summary(dta_agg_userdpt)
+
+# USER-AISLE(PRODUCT)
+dta_agg_userais <- dta[, list(f_ua_reorder = mean(reordered),
+                              f_ua_cartordernorm_m = mean(add_to_cart_order_norm)), 
+                       keyby = list(user_id, aisle_id)]
+dta[, ua_Nord := NULL]
+dta_agg <- dta[, list(ua_Nord = max(order_number)), keyby = c("user_id", "aisle_id")]
+dta <- merge(dta, dta_agg, by = c("user_id", "aisle_id"))
+
+dta[, misc := NULL]
+dta[, misc := min(order_number), by = list(user_id, aisle_id)]
+dta_agg <- dta[order_number>=misc, list(f_ua_reord_sincefirst=mean(reordered)), 
+               keyby = list(user_id, aisle_id)]
+dta_agg_userais <- merge(dta_agg_userais, dta_agg, keyby = c("user_id", "aisle_id"), all.x = T)
+
+dta_agg <- dta[order_number>(ua_Nord-10), list(f_ua_reord_last10=mean(reordered)), 
+               keyby = list(user_id, aisle_id)]
+dta_agg_userais <- merge(dta_agg_userais, dta_agg, keyby = c("user_id", "aisle_id"), all.x = T)
+
+dta_agg <- dta[order_number>(ua_Nord-25), list(f_ua_reord_last25=mean(reordered)), 
+               keyby = list(user_id, aisle_id)]
+dta_agg_userais <- merge(dta_agg_userais, dta_agg, keyby = c("user_id", "aisle_id"), all.x = T)
+
+dta[, misc := NULL]
+dta[, misc := ceiling(0.25*max(ua_Nord)+1), by = list(user_id, aisle_id)]
+dta_agg <- dta[order_number>=misc, list(f_ua_reord_last25p=mean(reordered, na.rm =T)), 
+               keyby = list(user_id, aisle_id)]
+dta[, misc := NULL]
+dta[, ua_Nord := NULL]
+dta_agg_userais <- merge(dta_agg_userais, dta_agg, keyby = c("user_id", "aisle_id"), all.x = T)
+dta_agg_userais[is.na(f_ua_reord_last25p), f_ua_reord_last25p := 0]
+
+
+# PRODUCT
+dta_agg_prod <- dta[eval_set == "prior", 
+                    list(f_p_reord = mean(reordered), 
+                         p_Nords = uniqueN(order_id), 
+                         p_Nuser = uniqueN(user_id), 
+                         f_p_cartorder_m = mean(add_to_cart_order), 
+                         f_p_cartordernorm_m = mean(add_to_cart_order_norm, na.rm = T),
+                         f_p_cartordernorm_sd = sd(add_to_cart_order_norm, na.rm = T),
+                         f_p_freqdays = mean(days_since_prior_order, na.rm = T),
+                         p_N = .N),
+                by = list(product_id)]
+mx_x <- median(dta_agg_prod$f_p_cartordernorm_sd, na.rm = T)
+dta_agg_prod[is.na(f_p_cartordernorm_sd), f_p_cartordernorm_sd := mx_x]
+dta_agg_prod[, f_p_freqbuy_order := p_Nords/mx_N_orders]
+dta_agg_prod[, f_p_freqbuy_user := p_Nuser/mx_N_users]
+
+# PRODUCT-DPT
+dta_agg_prod_dpt <- dta[eval_set == "prior", 
+                        list(f_p_dpt_reord = mean(reordered), 
+                         p_dpt_Nords = uniqueN(order_id), 
+                         p_dpt_Nuser = uniqueN(user_id), 
+                         p_dpt_N = .N),
+                by = list(department_id)]
+dta_agg_prod_dpt[, c("p_dpt_Nords", "p_dpt_Nuser", "p_dpt_N") := NULL]
+
+# PRODUCT-AISLE
+dta_agg_prod_ais <- dta[eval_set == "prior", 
+                        list(f_p_ais_reord = mean(reordered), 
+                         p_ais_Nords = uniqueN(order_id), 
+                         p_ais_Nuser = uniqueN(user_id), 
+                         p_ais_N = .N),
+                by = list(aisle_id)]
+dta_agg_prod_ais[, c("p_ais_Nords", "p_ais_Nuser", "p_ais_N") := NULL]
+
+# PRODUCT-DAYOFWEEK
+dta_agg_prod_dow <- data.table(merge(unique(dta$product_id), unique(dta$order_dow)))
+colnames(dta_agg_prod_dow) <- c("product_id", "order_dow")
+dta_agg <- dta[eval_set == "prior", list(p_N_dow = .N), keyby = list(product_id, order_dow)]
+dta_agg_prod_dow <- merge(dta_agg_prod_dow, dta_agg, by = c("product_id", "order_dow"), all = T)
+dta_agg <- dta[eval_set == "prior", list(p_N = .N), keyby = list(product_id)]
+dta_agg_prod_dow <- merge(dta_agg_prod_dow, dta_agg, by = "product_id", all = T)
+dta_agg_prod_dow[, f_p_Nperc_dow := p_N_dow/p_N]
+dta_agg_prod_dow[is.na(f_p_Nperc_dow), f_p_Nperc_dow := 0]
+dta_agg_prod_dow[, c("p_N_dow", "p_N") := NULL]
+
+# PRODUCT-HOUR
+dta_agg_prod_hour <- data.table(merge(unique(dta$product_id), unique(dta$order_hour_of_day)))
+colnames(dta_agg_prod_hour) <- c("product_id", "order_hour_of_day")
+dta_agg <- dta[eval_set == "prior", list(p_N_hour = .N), keyby = list(product_id, order_hour_of_day)]
+dta_agg_prod_hour <- merge(dta_agg_prod_hour, dta_agg, by = c("product_id", "order_hour_of_day"), all = T)
+dta_agg <- dta[eval_set == "prior", list(p_N = .N), keyby = list(product_id)]
+dta_agg_prod_hour <- merge(dta_agg_prod_hour, dta_agg, by = "product_id", all = T)
+dta_agg_prod_hour[, f_p_Nperc_hour := p_N_hour/p_N]
+dta_agg_prod_hour[is.na(f_p_Nperc_hour), f_p_Nperc_hour := 0]
+dta_agg_prod_hour[, c("p_N_hour", "p_N") := NULL]
+plot(dta_agg_prod_hour$order_hour_of_day[1:10000], dta_agg_prod_hour$f_p_Nperc_hour[1:10000])
+udf_memorycheck()
+
+# HOUR
+# what is the size of order given the hour of the day?
+dta_agg <- dta[, list(NpOrd = .N, 
+                      Nreord = sum(reordered),
+                      reord = sum(reordered)/.N,
+                      order_hour_of_day = max(order_hour_of_day)), 
+               by = list(order_id)]
+boxplot(reord ~ order_hour_of_day, data=dta_agg, main="N per ord", 
+        ylim = c(0, 1), xlab="order_hour_of_day", ylab="N per or")
+dta_agg_hour <- dta_agg[, list(fn_NpOrd_h_m = mean(NpOrd),
+                               fn_NOrdnorm_h = .N/mx_N_orders,
+                               #fn_NpOrd_h_sd = sd(NpOrd), 
+                               #fn_reord_h_sd = sd(reord),
+                               fn_reord_h_m = mean(reord)), 
+                   keyby = order_hour_of_day]
+plot(zoo(dta_agg_hour[, .(fn_NOrdnorm_h, fn_reord_h_m)], dta_agg_hour$order_hour_of_day), 
+     main = "", ylab = list("N", "reord"))
+
+# DAY
+# what is the size of the order by day of week?
+dta_agg <- dta[, list(NpOrd = .N, 
+                      Nreord = sum(reordered),
+                      reord = sum(reordered)/.N,
+                      order_dow = max(order_dow)), 
+               by = list(order_id)]
+boxplot(reord ~ order_dow, data=dta_agg, main="N per ord", 
+        ylim = c(0, 1), xlab="order_dow", ylab="N per or")
+dta_agg_dow <- dta_agg[, list(fn_NpOrd_dow_m = mean(NpOrd),
+                              fn_NOrdnorm_dow = .N/mx_N_orders,
+                              #fn_NpOrd_dow_sd = sd(NpOrd), 
+                              #fn_reord_dow_sd = sd(reord),
+                              fn_reord_dow_m = mean(reord)), 
+                   keyby = order_dow]
+plot(zoo(dta_agg_dow[, .(fn_NOrdnorm_dow, fn_reord_dow_m)], dta_agg_dow$order_dow), 
+     main = "", ylab = list("N", "reord"))
+#
+udf_memorycheck()
+
+```
+\
+# Model: isNone
+## Create train/test data for modelling "isNone"
+```{r}
+# create train
+dta_train <- dta_ord_prod_train[, list(Nreord = sum(reordered)), keyby = order_id]
+dta_train <- merge(dta_orders[eval_set == "train", ], dta_train, by = "order_id")
+dta_test <- dta_orders[eval_set == "test", ]
+dta_test[, Nreord := NA]
+dta_train <- rbind(dta_train, dta_test)
+rm(dta_test)
+dta_train[, y_None := (Nreord == 0) * 1] # def y
+summary(dta_train$y_None)
+
+# adding features
+dta_train <- merge(dta_train, dta_agg_hour, by = "order_hour_of_day")
+dta_train <- merge(dta_train, dta_agg_dow, by = "order_dow")
+dta_train <- merge(dta_train, dta_agg_user, by = "user_id")
+#
+```
+\
+## Train XGB - isNone
+```{r}
+mx_Xs <- colnames(dta_train)[grep("^f_", colnames(dta_train))]
+mx_Xs <- c(mx_Xs, colnames(dta_train)[grep("^fn_", colnames(dta_train))])
+mx_Xs <- c(mx_Xs, "order_dow", "order_hour_of_day", "days_since_prior_order")
+
+# def in/val/test sample
+dta_train[, .N, by = eval_set]
+setorder(dta_train, -eval_set)
+mx_x <- dta_train[, sum(eval_set == "train")]
+mx_cut <- 0.50 # 0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+udf_getdataXGB(2, "y_None", mx_Xs)
+
+par_scaleposw <- dta_train[fold == 1, mean(y_None)]
+param <- list(objective = "binary:logistic", # "binary:logistic" # "reg:logistic"
+              eval_metric = "auc",  #"auc", "logloss"
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              colsample_bytree = 0.9,
+              subsample = 0.75,
+              max_depth = 5,
+              min_child_weight = 10,
+              #scale_pos_weight = par_scaleposw,
+              eta = 0.10)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 250,
+                     #watchlist = list(train = dta_xgb.train),
+                     watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+# auc: 0.8326, 0.8389 (valid)
+# nrounds ~ (70+65)/2 = 100, based on 2-fold cv  (127+102)/2
+
+# var imp
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+xgb.plot.importance(mx_varimp)
+
+# less features
+mx_Xs_slctd <- mx_varimp[(Gain > 0.0001) & 1:nrow(mx_varimp) <= 20, Feature]
+mx_Xs_out_None <- setdiff(mx_Xs, mx_Xs_slctd) # Xs useless
+
+mx_cut <- 0.999 # 0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+udf_getdataXGB(1, "y_None", mx_Xs_slctd)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 70,
+                     watchlist = list(train = dta_xgb.train),
+                     #watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+# auc=0.8478 (20 feats)
+# auc=0.8489 (20 feats)
+
+# compute predictions
+dta_train[, pred.y_None := -1]
+dta_train[eval_set == "train" & fold == 1, pred.y_None := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_train[eval_set == "train" & fold != 1, pred.y_None := round(predict(fit.xgb, dta_xgb.valid), 5)]
+dta_train[eval_set == "test", pred.y_None := round(predict(fit.xgb, dta_xgb.test), 5)]
+summary(dta_train[, pred.y_None])
+
+# keep model predictions
+dta_pred.y_None <- dta_train[, .(user_id, order_id, eval_set, pred.y_None)]
+fwrite(dta_pred.y_None, paste0(dir_data, "dta_pred_y_None.csv"))
+
+```
+\
+## Train XGB - how many N reordered
+```{r}
+# dta_train[, y_Nreord := NULL] # def y
+mx_Xs <- colnames(dta_train)[grep("^f_", colnames(dta_train))]
+mx_Xs <- c(mx_Xs, colnames(dta_train)[grep("^fn_", colnames(dta_train))])
+mx_Xs <- c(mx_Xs, "order_number", "order_dow", "order_hour_of_day", "days_since_prior_order")
+
+# def in/val/test sample
+setorder(dta_train, -eval_set)
+dta_train[, .N, by = eval_set]
+mx_x <- dta_train[, sum(eval_set == "train")]
+mx_cut <- 0.50 #0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+udf_getdataXGB(1, "Nreord", mx_Xs)
+
+#par_scaleposw <- dta_train[fold == 1, mean(Nreord)]
+param <- list(objective = "reg:linear" , # "binary:logistic" # "reg:logistic" # "reg:linear" 
+              eval_metric = "rmse",
+              #eval_metric = "auc",  #"auc", "logloss", "rmse"
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              colsample_bytree = 0.9,
+              subsample = 0.75,
+              max_depth = 5,
+              min_child_weight = 10,
+              #scale_pos_weight = par_scaleposw,
+              eta = 0.10)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 150,
+                     #watchlist = list(train = dta_xgb.train),
+                     watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+# rmse: 3.7675, 3.749
+# nrounds ~ 70=(71+71)/2 , based on 2-fold cv
+
+# var imp
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+xgb.plot.importance(mx_varimp)
+
+# less features
+mx_Xs_slctd <- mx_varimp[(Gain > 0.0001) & 1:nrow(mx_varimp) <= 15, Feature]
+mx_Xs_out_N <- setdiff(mx_Xs, mx_Xs_slctd) # Xs useless
+
+#
+mx_cut <- 0.999 #0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+udf_getdataXGB(1, "Nreord", mx_Xs_slctd)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 80,
+                     watchlist = list(train = dta_xgb.train),
+                     #watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+
+# rmse=3.741, r.sq=0.604
+# rmse=3.646
+
+# compute predictions
+dta_train[, pred.y_N := -1]
+dta_train[eval_set == "train" & fold == 1, pred.y_N := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_train[eval_set == "train" & fold != 1, pred.y_N := round(predict(fit.xgb, dta_xgb.valid), 5)]
+dta_train[eval_set == "test", pred.y_N := round(predict(fit.xgb, dta_xgb.test), 5)]
+summary(dta_train[, pred.y_N])
+
+udf_R.squared(dta_train[eval_set == "train", Nreord], dta_train[eval_set == "train", pred.y_N])
+# 0.624
+
+# keep model predictions
+dta_pred.y_N <- dta_train[, .(user_id, order_id, eval_set, pred.y_N)]
+fwrite(dta_pred.y_N, paste0(dir_data, "ddta_pred_y_N.csv"))
+
+udf_memorycheck()
+```
+\
+\
+# Model: isReordered
+## Create train/test data, def y
+create the train sample with previously ordered products
+1 - if exists in train, 0 - if doesn't exist, reorder = 0 remove from train
+```{r}
+# dta_agg_userprod <- fread(paste0(dir_data, "dta_agg_userprod.csv"))
+udf_memorycheck()
+dta_agg_user_id_product_id <- dta[, list(N_up = .N), keyby = .(user_id, product_id)]
+
+# TRAIN
+dta_train <- merge(dta_orders[eval_set=="train", .(order_id, user_id)], dta_ord_prod_train, by="order_id", all = T)
+dta_train <- dta_train[reordered == 1, ]
+dta_train[, add_to_cart_order := NULL]
+dta_train <- merge(dta_train, dta_agg_user_id_product_id, by = c("user_id", "product_id"), all = T)
+
+dta_train[, y := reordered] 
+dta_train[is.na(reordered), y := 0]
+dta_train <- dta_train[, .(user_id, product_id, y)]
+
+dta_train <- merge(dta_orders[eval_set == "train", ], dta_train, by = c("user_id"), all.x = T)
+
+# TEST
+dta_test <- dta_orders[eval_set=="test", .(order_id, user_id)]
+dta_test <- merge(dta_test, dta_agg_user_id_product_id, by = c("user_id"), all.x = T)
+dta_test <- dta_test[, .(user_id, order_id, product_id)]
+dta_test <- merge(dta_orders[eval_set == "test", ], dta_test, by = c("user_id", "order_id"), all.x = T)
+dta_test[, y := NA]
+dta_test
+
+mean(dta_orders[eval_set == "test", order_id] %in% dta_test[, order_id])
+
+dta_train <- rbind(dta_train, dta_test)
+dta_train <- merge(dta_train, dta_products[, c("product_id", "aisle_id", "department_id"), with=F], by = "product_id", all.x = T)
+
+rm("dta_test", "dta_agg_user_id_product_id"); gc()
+udf_memorycheck()
+
+mx_Xs_weak <- c("f_p_dpt_reord", "f_p_dpt_freqbuy_order", "f_p_dpt_freqbuy_user", "f_p_ais_freqbuy_order", "f_p_ais_freqbuy_user",
+  "f_u_Nproduniq", "f_u_Nprod", "f_u_dayssince_q50", "f_u_NrepOrd_q50", "f_u_NrepOrd_q90", "f_u_NrepOrd_m", "f_u_reordpOrd_sd",    
+  #"f_up_ordnum_first", "f_up_ordnum_last", "f_up_N", 
+  "f_ud_ordnum_first", "f_ud_ordnum_last", "f_ud_N", "f_ud_reord_last4", "f_ua_ordnum_first",
+  "f_ua_ordnum_last", "f_ua_N", "f_ua_reord_last4", "order_number", "order_dow", "order_hour_of_day", 
+  "f_u_Ndpt", 
+  "f_p_ais_reord", "f_ud_reord_last10", "f_ua_reord_sincefirst",
+  "f_ua_reord_last10", "f_ua_reord_last25", "f_p_Nperc_hour", "fn_NpOrd_dow_m", "fn_NOrdnorm_dow", "fn_reord_dow_m", 
+  "f_u_NpOrd_q50", "f_u_NrepOrd_m_p50", "f_ud_reord_sincefirst", "f_ua_cartordernorm_m", "f_p_Nperc_dow", 
+  "fn_NpOrd_h_m", "fn_NOrdnorm_h" )
+
+# concatenate features to TRAIN
+# user
+mx_Xs <- colnames(dta_agg_user)[grep("^f_", colnames(dta_agg_user))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_user[, c("user_id", mx_Xs), with=F], by = "user_id", all.x = T)
+# user-product
+mx_Xs <- colnames(dta_agg_userprod)[grep("^f_", colnames(dta_agg_userprod))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_userprod[, c("user_id", "product_id", mx_Xs), with=F], 
+                   by = c("user_id", "product_id"), all.x = T)
+fwrite(dta_agg_userprod, paste0(dir_data, "dta_agg_userprod.csv"))
+rm(dta_agg_userprod); gc()
+# user-dpt
+mx_Xs <- colnames(dta_agg_userdpt)[grep("^f_", colnames(dta_agg_userdpt))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_userdpt[, c("user_id", "department_id", mx_Xs), with=F], 
+                   by = c("user_id", "department_id"), all.x = T)
+# user-aisle
+mx_Xs <- colnames(dta_agg_userais)[grep("^f_", colnames(dta_agg_userais))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_userais[, c("user_id", "aisle_id", mx_Xs), with=F], 
+                   by = c("user_id", "aisle_id"), all.x = T)
+udf_memorycheck()
+
+# product
+mx_Xs <- colnames(dta_agg_prod)[grep("^f_", colnames(dta_agg_prod))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_prod[, c("product_id", mx_Xs), with=F], by = "product_id", all.x = T)
+# product-department
+mx_Xs <- colnames(dta_agg_prod_dpt)[grep("^f_", colnames(dta_agg_prod_dpt))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_prod_dpt[, c("department_id", mx_Xs), with=F], by = "department_id", all.x = T)
+# product-aisle
+mx_Xs <- colnames(dta_agg_prod_ais)[grep("^f_", colnames(dta_agg_prod_ais))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_prod_ais[, c("aisle_id", mx_Xs), with=F], by = "aisle_id", all.x = T)
+udf_memorycheck()
+
+# product_dow
+mx_Xs <- colnames(dta_agg_prod_dow)[grep("^f_", colnames(dta_agg_prod_dow))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_prod_dow[, c("product_id", "order_dow", mx_Xs), with=F], 
+                   by = c("product_id", "order_dow"), all.x = T)
+# product_hour
+mx_Xs <- colnames(dta_agg_prod_hour)[grep("^f_", colnames(dta_agg_prod_hour))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_prod_hour[, c("product_id", "order_hour_of_day", mx_Xs), with=F], 
+                   by = c("product_id", "order_hour_of_day"), all.x = T)
+# day
+mx_Xs <- colnames(dta_agg_dow)[grep("^fn_", colnames(dta_agg_dow))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_dow[, c("order_dow", mx_Xs), with=F], 
+                   by = c("order_dow"), all.x = T)
+# hour
+mx_Xs <- colnames(dta_agg_hour)[grep("^fn_", colnames(dta_agg_hour))]
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+dta_train <- merge(dta_train, dta_agg_hour[, c("order_hour_of_day", mx_Xs), with=F], 
+                   by = c("order_hour_of_day"), all.x = T)
+udf_memorycheck()
+
+# add some more features
+dta_train[, f_p_dayssince_norm := days_since_prior_order/f_p_freqdays]
+dta_train[, f_u_dayssince_norm := days_since_prior_order/f_u_dayssince_m]
+dta_train[, f_u_dayssince_diff := days_since_prior_order - f_u_dayssince_m]
+dta_train[, f_up_dayssince_norm := days_since_prior_order/f_up_days_since_prior_order_m]
+dta_train[, f_up_dayssince_diff := days_since_prior_order-f_up_days_since_prior_order_m]
+dta_train[, f_up_freqbuy := f_up_N/f_u_Nords]
+dta_train[, f_up_reord_sincefirst := f_up_N/(f_u_Nords - f_up_ordnum_first + 1)]
+dta_train[, f_up_orderssincelast := f_u_Nords - f_up_ordnum_last]
+dta_train[, f_up_orderssincelast_norm := (f_u_Nords - f_up_ordnum_last)/(f_u_Nords - 1)]
+
+dta_train[, c("f_up_ordnum_first", "f_ud_ordnum_first", "f_ud_ordnum_last", "f_ua_ordnum_first", "f_ua_ordnum_last") := NULL]
+fwrite(dta_train, paste0(dir_data, "dta_train_isReord.csv"))
+udf_memorycheck()
+```
+\
+## Train XGB - isReordered
+```{r}
+# release memory
+fwrite(dta, paste0(dir_data, "dta.csv"))
+rm(dta); gc()
+
+# Xs
+mx_Xs <- colnames(dta_train)[grep("^f_", colnames(dta_train))]
+mx_Xs <- c(mx_Xs, colnames(dta_train)[grep("^fn_", colnames(dta_train))])
+mx_Xs <- c(mx_Xs, "order_dow", "order_hour_of_day", "days_since_prior_order")
+mx_Xs <- setdiff(mx_Xs, mx_Xs_weak)
+
+# def in/val/test sample
+setorder(dta_train, -eval_set, user_id)
+dta_train[, fold := 0]
+dta_train[, .N, by = eval_set]
+mx_x <- dta_train[, sum(eval_set == "train")]
+mx_cut1 <- 0; mx_cut2 <- 0.50
+dta_train[eval_set == "train" & mx_cut1*mx_x < 1:nrow(dta_train) & 1:nrow(dta_train) <= mx_cut2*mx_x, fold := 1]
+mx_cut1 <- 0.50; mx_cut2 <- 0.999
+dta_train[eval_set == "train" & mx_cut1*mx_x < 1:nrow(dta_train) & 1:nrow(dta_train) <= mx_cut2*mx_x, fold := 2]
+dta_train[eval_set == "test", fold := -1]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+#rm(dta_agg, dta_agg_userprod, dta_ord_prod_prior, dta_orders)
+udf_memorycheck()
+udf_getdataXGB(1, "y", mx_Xs)
+
+# parameters selected based on CV
+#par_scaleposw <- dta_train[fold == 1, mean(y)]
+param <- list(objective = "binary:logistic", # "binary:logistic" # "reg:logistic"
+              eval_metric = "logloss",  #"auc", "logloss"
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              colsample_bytree = 0.8,
+              subsample = 0.75,
+              max_depth = 7,
+              min_child_weight = 10,
+              #scale_pos_weight = par_scaleposw,
+              eta = 0.10)
+
+# train with all feats, less rounds for varimp
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 50, # 10 # 25
+                     #watchlist = list(train = dta_xgb.train),
+                     watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 5,
+                     nthread = 7)
+
+# cv: 100+ rounds with eta=0.075
+# cv: 130 rounds with eta=0.10
+
+# var imp
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+xgb.plot.importance(mx_varimp)
+mx_Xs_slct <- mx_varimp[(Gain > 0.0001) | 1:nrow(mx_varimp) <= 45, Feature]
+mx_Xs_out_isReord <- setdiff(mx_Xs, mx_Xs_slct) # Xs useless
+# dta_train[, c(mx_Xs_out_isReord) := NULL]
+
+# get xgb dense matrix data
+dta_train[, fold := 0]
+mx_x <- dta_train[, sum(eval_set == "train")]
+mx_cut1 <- 0; mx_cut2 <- 0.999
+dta_train[eval_set == "train" & mx_cut1*mx_x < 1:nrow(dta_train) & 1:nrow(dta_train) <= mx_cut2*mx_x, fold := 1]
+mx_cut1 <- 0.999; mx_cut2 <- 1
+dta_train[eval_set == "train" & mx_cut1*mx_x < 1:nrow(dta_train) & 1:nrow(dta_train) <= mx_cut2*mx_x, fold := 2]
+dta_train[eval_set == "test", fold := -1]
+dta_train[, .N, by = fold]
+
+# 
+#rm(dta); gc()
+udf_memorycheck()
+udf_getdataXGB(1, "y", mx_Xs_slct)
+
+# train with less feats, more rounds
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 125, # 10
+                     watchlist = list(train = dta_xgb.train),
+                     #watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+
+mx_varimp <- xgb.importance(feature_names = mx_Xs_slct, model = fit.xgb)
+xgb.plot.importance(mx_varimp)
+
+# BENCHMARK logloss on kaggle: 0.242, 0.208
+# nrounds: 50, auc=0.8299, all Xs
+# nrounds: 50, auc=0.8291, top 18 Xs based on varimp after xgb w 10 rounds
+# nrounds: 50, auc=0.8299, top 25 Xs based on varimp after xgb w 15 rounds
+# eta=0.05, 30 top feats, nrounds = 41 (2-fold cv), logloss=0.2940
+# eta=0.05, 40 top feats, nrounds = 41 (2-fold cv), logloss=0.2932
+# eta=0.10, 45 top feats, nrounds = 125 (1-fold cv), logloss=0.2423
+
+# compute predictions
+dta_train[, pred.y_isReord := -1]
+dta_train[eval_set == "train" & fold == 1, pred.y_isReord := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_train[eval_set == "train" & fold != 1 & fold > 0, pred.y_isReord := round(predict(fit.xgb, dta_xgb.valid), 5)]
+dta_train[eval_set == "test", pred.y_isReord := round(predict(fit.xgb, dta_xgb.test), 5)]
+summary(dta_train[, pred.y_isReord])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.00000 0.01000 0.01000 0.01718 0.02000 0.61000
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#0.00087 0.01870 0.04612 0.09793 0.11500 0.97250 
+
+# sort products by predicted probability, assign order number
+setorder(dta_train, -eval_set, user_id, -pred.y_isReord)
+dta_train[, cumcount := ave(user_id==user_id, user_id, FUN=cumsum)]
+head(dta_train[, .(user_id, product_id, pred.y_isReord, cumcount)], 100)
+
+# keep predictions
+dta_pred.y_isReord <- dta_train[, .(user_id, order_id, product_id, y, eval_set, pred.y_isReord, cumcount)]
+nrow(dta_pred.y_isReord)
+fwrite(dta_pred.y_isReord, paste0(dir_data, "dta_pred_y_isReord.csv"))
+
+rm(dta_xgb.train, dta_xgb.valid, dta_xgb.test); gc()
+udf_memorycheck()
+
+```
+\
+## Find the optimal probability threshold to optimize mean f1score 
+```{r}
+# initial grid
+mx_x <- udf_quantile(dta_pred.y_isReord[, pred.y_isReord], c(0.05, 0.95))
+mx_x <- seq(mx_x[1], mx_x[2], (mx_x[2] - mx_x[1])/10)
+mx_x <- data.frame(tres = mx_x, mf1 = NA)
+for (i in 1:nrow(mx_x)) {
+  dta_pred.y_isReord[, predy := (pred.y_isReord > mx_x$tres[i]) * 1]
+  mx_x[i, "mf1"] <- udf_meanF1score(dta_pred.y_isReord[eval_set == "train", .(user_id, product_id, y)], 
+                                  dta_pred.y_isReord[eval_set == "train", .(user_id, product_id, predy)])
+  print(mx_x[i, ])
+}
+plot(mx_x$tres, mx_x$mf1, type = "o", lwd = 2, main = "mean F1 score")
+mx_threshold.p_isReord <- mx_x$tres[which.max(mx_x$mf1)]
+paste0("p>", round(mx_threshold.p_isReord, 4), " meanF1score=", round(max(mx_x$mf1), 4))
+
+# fine tuning
+mx_x <- data.frame(tres = mx_threshold.p_isReord * seq(0.95, 1.05, 0.01), mf1 = NA)
+for (i in 1:nrow(mx_x)) {
+  dta_pred.y_isReord[, predy := (pred.y_isReord > mx_x$tres[i]) * 1]
+  mx_x[i, "mf1"] <- udf_meanF1score(dta_pred.y_isReord[eval_set == "train", .(user_id, product_id, y)], 
+                                  dta_pred.y_isReord[eval_set == "train", .(user_id, product_id, predy)])
+  print(mx_x[i, ])
+}
+plot(mx_x$tres, mx_x$mf1, type = "o", lwd = 2, main = "mean F1 score")
+if (length(unique(mx_x$mf1[!is.na(mx_x$mf1)])) > 0) {
+  mx_threshold.p_isReord <- mx_x$tres[which.max(mx_x$mf1)]
+  paste0("p>", round(mx_threshold.p_isReord, 4), " meanF1score=", round(max(mx_x$mf1), 4))
+}
+# "p>0.1933 meanF1score=0.3853"
+
+# predict whether product shoud be included
+dta_pred.y_isReord[, predy := (pred.y_isReord > mx_threshold.p_isReord) * 1] 
+
+# keep predictions
+dta_pred.y <- dta_pred.y_isReord[, .(user_id, order_id, product_id, y, eval_set, pred.y_isReord, cumcount)]
+
+```
+\
+## Find the optimal probability threshold of isNone to optimize mean f1score 
+```{r}
+#dta_pred.y <- merge(dta_pred.y, dta_pred.y_None[, .(user_id, order_id, pred.y_None)], by = c("user_id", "order_id"))
+dta_pred.y_None <- dta_pred.y_None[, .(user_id, order_id, eval_set, pred.y_None)]
+dta_pred.y_None[, product_id := 0]
+dta_pred.y_None[, cumcount := 0]
+dta_pred.y_None[, pred.y_isReord := pred.y_None]
+
+mx_t <- dta_pred.y[eval_set == "train", list(Nreord = sum(y)), by = user_id]
+mx_t[, y := (Nreord == 0) * 1]
+dta_pred.y_None <- merge(dta_pred.y_None, mx_t[, .(user_id, y)], by = "user_id", all.x = T)
+
+mx_cols <- c("user_id", "order_id", "product_id", "y", "eval_set", "pred.y_isReord", "cumcount")
+dta_pred.y <- rbind(dta_pred.y[, mx_cols, with=F], dta_pred.y_None[, mx_cols, with=F])
+setorder(dta_pred.y, user_id, cumcount)
+# head(dta_pred.y, 100)
+
+# initial grid
+mx_x <- udf_quantile(dta_pred.y[product_id == 0, pred.y_isReord], c(0.05, 0.99))
+mx_x <- seq(mx_x[1], mx_x[2], (mx_x[2] - mx_x[1])/10)
+mx_x <- data.frame(tres = mx_x, mf1 = NA)
+mx_x
+
+for (i in 1:nrow(mx_x)) {
+  # i <- 1
+  dta_pred.y[product_id != 0, predy := (pred.y_isReord > mx_threshold.p_isReord) * 1]
+  dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_x$tres[i]) * 1]
+  mx_x[i, "mf1"] <- udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                                  dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+  gc(verbose = F)
+  print(mx_x[i, ])
+}
+plot(mx_x$tres, mx_x$mf1, type = "o", lwd = 2, main = "mean F1 score")
+mx_threshold.p_isNone <- mx_x$tres[which.max(mx_x$mf1)]
+paste0("isNone: p>", round(mx_threshold.p_isNone, 4), " meanF1score=", round(max(mx_x$mf1), 4))
+
+# fine tuning
+mx_x <- data.frame(merge(mx_threshold.p_isNone * seq(0.90, 1.10, 0.05), 
+                         mx_threshold.p_isReord * seq(0.90, 1.10, 0.05)), 
+                         mf1 = NA)
+colnames(mx_x) <- c("tresNone", "tresReord", "mf1")
+
+for (i in 1:nrow(mx_x)) {
+  # i <- 1
+  dta_pred.y[product_id != 0, predy := (pred.y_isReord > mx_x$tresReord[i]) * 1]
+  dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_x$tresNone[i]) * 1]
+  mx_z <- dta_pred.y[product_id != 0, .(predNReord = sum(predy)), by = user_id]
+  mx_z <- mx_z[, predNReord := (predNReord == 0) * 1]
+  dta_pred.y[, predNReord := NULL]
+  dta_pred.y <- merge(dta_pred.y, mx_z, by = "user_id", all.x = T)
+  dta_pred.y[product_id == 0 & predNReord == 1, predy := 1]
+  mx_x[i, "mf1"] <- udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                                  dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+  gc(verbose = F)
+  print(mx_x[i, ])
+}
+plot(mx_x$mf1, type = "o", lwd = 2, main = "mean F1 score")
+mx_threshold.p_isNone <- mx_x$tresNone[which.max(mx_x$mf1)]
+mx_threshold.p_isReord <- mx_x$tresReord[which.max(mx_x$mf1)]
+paste0("isReord: p>", round(mx_threshold.p_isReord, 4), 
+       " isNone: p>", round(mx_threshold.p_isNone, 4), 
+       " meanF1score=", round(max(mx_x$mf1, na.rm = T), 4))
+
+# "isReord: p>0.1933 isNone: p>0.0981 meanF1score=0.3913"
+
+# def pred
+dta_pred.y[product_id != 0, predy := (pred.y_isReord > mx_threshold.p_isReord) * 1]
+dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_threshold.p_isNone) * 1]
+# with correction with no products and no None
+mx_z <- dta_pred.y[product_id != 0, .(predNReord = sum(predy)), by = user_id]
+mx_z <- mx_z[, predNReord := (predNReord == 0) * 1]
+dta_pred.y[, predNReord := NULL]
+dta_pred.y <- merge(dta_pred.y, mx_z, by = "user_id", all.x = T)
+dta_pred.y[product_id == 0 & predNReord == 1, predy := 1]
+
+udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+# 0.3894215
+
+```
+\
+## Find optimal threshold (max F1) for each order
+```{r}
+udf_memorycheck()
+setorder(dta_pred.y, user_id, cumcount)
+#head(dta_pred.y_isReord, 100)
+dta_pred.y[, f1score_N := -1]
+dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_threshold.p_isNone) * 1]
+dta_pred.y[, maxcumcount := max(cumcount), by = user_id]
+
+# (!) this takes long
+for(mx_N in 1:max(dta_pred.y$cumcount)) {
+  #mx_N <- 0 # 404
+  gc(verbose = F)
+  dta_pred.y[product_id != 0, predy := (cumcount <= mx_N) * 1]
+  mx_agg <- udf_meanF1scoreAgg(dta_pred.y[eval_set == "train" & maxcumcount >= mx_N, .(user_id, product_id, y)], 
+                                  dta_pred.y[eval_set == "train" & maxcumcount >= mx_N, .(user_id, product_id, predy)])
+  mx_agg[, cumcount := mx_N]
+  colnames(mx_agg) <- c("user_id", "f1score", "cumcount")
+  dta_pred.y <- merge(dta_pred.y, mx_agg, by = c("user_id", "cumcount"), all.x = T)
+  dta_pred.y[!is.na(f1score), f1score_N := f1score]
+  dta_pred.y[, f1score := NULL]
+  print(paste("N=", mx_N, "  non%=", round(dta_pred.y[eval_set == "train", sum(f1score_N == -1)/.N], 4)))
+  if (dta_pred.y[eval_set == "train", sum(f1score_N == -1)/.N] < 0.015) { break; }
+}
+#dta_pred.y[maxcumcount > 540 & eval_set == "train", ]
+#head(dta_pred.y[user_id == 15124, ], 100)
+dta_pred.y[eval_set == "train" & product_id == 0 & f1score_N <= 0, f1score_N := 0.000001]
+
+if (F) {
+  dta_pred.y[eval_set == "train", m_f1score_N := f1score_N]
+}
+if (T) {
+  dta_pred.y[maxcumcount >= 3 & eval_set == "train", m_f1score_N := rollmean(f1score_N, 3, align="center", na.pad=T), by=user_id]
+  dta_pred.y[eval_set == "train" & is.na(m_f1score_N), m_f1score_N := f1score_N]
+  #dta_pred.y[maxcumcount < 3 & eval_set == "train", ]
+  dta_pred.y[maxcumcount < 3 & eval_set == "train", sum(is.na(m_f1score_N))]
+  #dta_pred.y[, maxcumcount := NULL]
+}
+
+dta_Noptim <- dta_pred.y[eval_set == "train", 
+                     list(max_f1score_N = max(m_f1score_N), 
+                          cumcount_optim = .SD[max(m_f1score_N)==m_f1score_N, cumcount], 
+                          threshold_optim = .SD[max(m_f1score_N)==m_f1score_N, pred.y_isReord]), by=user_id]
+#dta_Noptim[, isDupl := duplicated(user_id)]
+#dta_Noptim[isDupl == T, ]
+#dta_Noptim[user_id == 298, ]
+#head(dta_pred.y[user_id == 213, ], 100)
+dta_Noptim[, mean(max_f1score_N)] # 0.5010158 # 0.5070775 # 0.5298
+dta_Noptim <- dta_Noptim[, list(cumcount_optim = mean(cumcount_optim), 
+                                threshold_optim = mean(threshold_optim)), by = user_id]
+udf_hist_rngcut(dta_Noptim$cumcount_optim)
+udf_hist_rngcut(dta_Noptim$threshold_optim)
+
+```
+\
+# Model: optimal N
+## Create train/test data 
+```{r}
+# create train
+dta_train <- dta_ord_prod_train[, list(Nreord = sum(reordered)), keyby = order_id]
+dta_train <- merge(dta_orders[eval_set == "train", ], dta_train, by = "order_id")
+dta_test <- dta_orders[eval_set == "test", ]
+dta_test[, Nreord := NA]
+dta_train <- rbind(dta_train, dta_test)
+rm(dta_test)
+dta_train[, y_None := (Nreord == 0) * 1] # def y
+summary(dta_train$y_None)
+
+# adding features
+dta_train <- merge(dta_train, dta_agg_hour, by = "order_hour_of_day")
+dta_train <- merge(dta_train, dta_agg_dow, by = "order_dow")
+dta_train <- merge(dta_train, dta_agg_user, by = "user_id")
+
+# add N,p optim - target vars
+dta_train <- merge(dta_train, dta_Noptim, by = "user_id", all.x = T)
+
+```
+\
+## Train XGB - optimal
+```{r}
+# dta_train[, y_Nreord := NULL] # def y
+mx_Xs <- colnames(dta_train)[grep("^f_", colnames(dta_train))]
+mx_Xs <- c(mx_Xs, colnames(dta_train)[grep("^fn_", colnames(dta_train))])
+mx_Xs <- c(mx_Xs, "order_number", "order_dow", "order_hour_of_day", "days_since_prior_order")
+
+# def in/val/test sample
+setorder(dta_train, -eval_set)
+dta_train[, .N, by = eval_set]
+mx_x <- dta_train[, sum(eval_set == "train")]
+mx_cut <- 0.50 # 0.999 # 0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+#udf_getdataXGB(1, "threshold_optim", mx_Xs)
+udf_getdataXGB(2, "cumcount_optim", mx_Xs)
+
+param <- list(objective = "reg:linear" , # "binary:logistic" # "reg:logistic" # "reg:linear" 
+              eval_metric = "rmse",
+              #eval_metric = "auc",  #"auc", "logloss", "rmse"
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              colsample_bytree = 0.9,
+              subsample = 0.75,
+              max_depth = 5,
+              min_child_weight = 10,
+              eta = 0.10)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 100,
+                     #watchlist = list(train = dta_xgb.train),
+                     watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+
+# nrounds ~ 37=(40+34)/2 , based on 2-fold cv # N
+# nrounds ~ 67=(70+64)/2 , based on 2-fold cv # p
+# n:61, rmse:0.388, n:61, rmse:0.389
+
+# nrounds ~ 82=(77 + 88)/2, p - threshold
+# n:81, rmse:0.12
+
+# nrounds ~ 30=(42 + 18)/2, p - threshold
+# n:30, rmse:0.12
+
+# var imp
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+xgb.plot.importance(mx_varimp)
+
+# less features
+mx_Xs_slctd <- mx_varimp[Gain > 0.001, Feature]
+mx_Xs_out_Noptim <- setdiff(mx_Xs, mx_Xs_slctd) # Xs useless
+
+
+mx_cut <- 0.999 # 0.999 # 0.50
+dta_train[eval_set == "train" & 1:nrow(dta_train) <= mx_cut*mx_x, fold := 1]
+dta_train[eval_set == "train" & 1:nrow(dta_train) > mx_cut*mx_x, fold := 2]
+dta_train[, .N, by = fold]
+
+# get xgb dense matrix data
+#udf_getdataXGB(1, "threshold_optim", mx_Xs_slctd)
+udf_getdataXGB(1, "cumcount_optim", mx_Xs)
+
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 47,
+                     watchlist = list(train = dta_xgb.train),
+                     #watchlist = list(valid = dta_xgb.valid, train = dta_xgb.train),
+                     early.stop.round = 10,
+                     nthread = 8)
+
+# rmse=11.801003
+# rmse=10.49
+# rmse=0.024300, 0.026060, 
+# rmse=0.037
+# rmse=0.1182
+
+# compute predictions
+dta_train[, pred.y_Noptim := -1]
+dta_train[eval_set == "train" & fold == 1, pred.y_Noptim := round(predict(fit.xgb, dta_xgb.train), 4)]
+dta_train[eval_set == "train" & fold != 1, pred.y_Noptim := round(predict(fit.xgb, dta_xgb.valid), 4)]
+dta_train[eval_set == "test", pred.y_Noptim := round(predict(fit.xgb, dta_xgb.test), 4)]
+summary(dta_train[, pred.y_Noptim])
+
+udf_R.squared(dta_train[eval_set == "train", threshold_optim], dta_train[eval_set == "train", pred.y_Noptim])
+# r.sq=0.2225093 (N)
+# r.sq=0.3858742, 0.3042 (prob)
+# r.sq=0.335 (prob)
+
+# keep model predictions
+dta_pred.y_Noptim <- dta_train[, .(user_id, order_id, eval_set, pred.y_Noptim)]
+
+udf_memorycheck()
+
+# add pred N optim to pred dt
+#dta_pred.y[, pred.y_Noptim := NULL]
+#dta_pred.y_Noptim <- fread(paste0(dir_data, "dta_pred_y_Noptim.csv"))
+dta_pred.y <- merge(dta_pred.y, dta_pred.y_Noptim[, .(user_id, pred.y_Noptim)], by = "user_id", all.x = T)
+
+#
+dta_pred.y[, predy := -1]
+dta_pred.y[product_id != 0, predy := (cumcount <= pred.y_Noptim) * 1]
+#dta_pred.y[product_id != 0, predy := (pred.y_isReord > pred.y_Noptim) * 1]
+dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_threshold.p_isNone) * 1]
+summary(dta_pred.y$predy)
+# with correction with no products and no None
+mx_z <- dta_pred.y[product_id != 0, .(predNReord = sum(predy)), by = user_id]
+mx_z <- mx_z[, predNReord := (predNReord == 0) * 1]
+dta_pred.y[, predNReord := NULL]
+dta_pred.y <- merge(dta_pred.y, mx_z, by = "user_id", all.x = T)
+dta_pred.y[product_id == 0 & predNReord == 1, predy := 1]
+dta_pred.y[, predNReord := NULL]
+
+#
+udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+# 0.3928
+
+fwrite(dta_pred.y_Noptim, paste0(dir_data, "dta_pred_y_Noptim.csv"))
+
+```
+\
+## Find the optimal weight between global thrshold and modeled threshold for each order
+```{r}
+# initial grid
+mx_x <- seq(0, 1, 0.10)
+mx_x <- data.frame(weight = mx_x, mf1 = NA)
+for (i in 1:nrow(mx_x)) {
+  # i <- 6
+  dta_pred.y[, predy := -1]
+  dta_pred.y[product_id!=0, predy := (pred.y_isReord > (mx_x$weight[i]*pred.y_Noptim +
+                                                          (1-mx_x$weight[i])*mx_threshold.p_isReord))*1]
+  dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_threshold.p_isNone) * 1]
+
+  # with correction with no products and no None
+  mx_z <- dta_pred.y[product_id != 0, .(predNReord = sum(predy)), by = user_id]
+  mx_z <- mx_z[, predNReord := (predNReord == 0) * 1]
+  dta_pred.y[, predNReord := NULL]
+  dta_pred.y <- merge(dta_pred.y, mx_z, by = "user_id", all.x = T)
+  dta_pred.y[product_id == 0 & predNReord == 1, predy := 1]
+  
+  mx_x[i, "mf1"] <- udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                                  dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+  print(mx_x[i, ])
+}
+plot(mx_x$weight, mx_x$mf1, type = "o", lwd = 2, main = "mean F1 score")
+mx_optim_w_Noptim <- mx_x$weight[which.max(mx_x$mf1)]
+
+dta_pred.y[, predy := -1]
+dta_pred.y[product_id!=0, predy := (pred.y_isReord > (mx_optim_w_Noptim*pred.y_Noptim +
+                                                          (1-mx_optim_w_Noptim)*mx_threshold.p_isReord))*1]
+dta_pred.y[product_id == 0, predy := (pred.y_isReord > mx_threshold.p_isNone) * 1]
+summary(dta_pred.y$predy)
+# with correction with no products and no None
+mx_z <- dta_pred.y[product_id != 0, .(predNReord = sum(predy)), by = user_id]
+mx_z <- mx_z[, predNReord := (predNReord == 0) * 1]
+dta_pred.y[, predNReord := NULL]
+dta_pred.y <- merge(dta_pred.y, mx_z, by = "user_id", all.x = T)
+dta_pred.y[product_id == 0 & predNReord == 1, predy := 1]
+dta_pred.y[, predNReord := NULL]
+
+udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+# 0.3953
+
+```
+\
+# create submission file
+```{r}
+#
+# check meanF1score
+udf_meanF1score(dta_pred.y[eval_set == "train", .(user_id, product_id, y)], 
+                dta_pred.y[eval_set == "train", .(user_id, product_id, predy)])
+
+if (!("product_id_s" %in% colnames(dta_pred.y))) {
+  dta_pred.y[, product_id_s := as.character(product_id)]
+  dta_pred.y[product_id == 0, product_id_s := "None"]
+}
+
+mx_sub <- dta_pred.y[eval_set == "test", 
+                    .(products = paste0(product_id_s[predy == 1], collapse=" "), N = sum(predy)), 
+                    keyby=order_id]
+# mx_sub[, sum(products == "")]
+#mx_sub[products == "", products := "None"]
+# add None to orders with a few products, N <= 2
+#mx_sub[N <= 2 & products != "None", products := paste(products, "None")]
+head(mx_sub$products, 100)
+
+fwrite(mx_sub[, .(order_id, products)], paste0(dir_out.submits, "sub_26.csv"))
+
+# mx_x1 <- mx_x # predy.N * predy.p # 2.5, 0.09
+# best: 0, 0.09, predy.N | predy.p, None if <= 2, mf1 0.366, 0.3768 (lb)
+# best: 0.085, predy.p, add None if <= 2, mf1 = 0.3695342, 0.3776 (lb)
+# sub_15: xgb 50 rounds, add None if <= 2, "p>0.0262 meanF1score=0.3783", 0.3859 LB
+# sub_16: xgb 50 rounds, "isReord: p>0.0262, isNone: p>0.0228 meanF1score=0.3808", 0.382 LB
+# sub_17: xgb 50 rounds, add None if <= 2, "isReord: p>0.0262, isNone: p>0.0228 meanF1score=0.3808", 0.3841 LB
+# sub_18: xgb 50 rounds (top 20), isReord: p>0.0262, isNone: p>0.0095 meanF1score=0.3850, 0.38758 LB
+# sub_19: xgb 50 rounds (top 20), "isReord: p>0.0244isNone: p>0.0095 meanF1score=0.3855", 0.38751 LB
+# sub_19: xgb 50 rounds (top 20), isReord: p>0.0244 isNone: p>0.0095 meanF1score=0.3858, 0.38751 LB
+# sub_21: with model for optim N, 0.3669065, 0.3693249 LB
+# sub 22: with model for optim thres, 0.50*model+0.5*global, 0.3867523, 0.3891 LB
+
+```
