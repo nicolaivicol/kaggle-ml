@@ -1,2 +1,2 @@
-# kaggle-ml
-Scripts for Kaggle competitions and machine learning
+# Kaggle, ML
+Scripts for Kaggle competitions and machine learning.
