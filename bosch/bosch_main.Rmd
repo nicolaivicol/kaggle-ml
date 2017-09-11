@@ -1,0 +1,1171 @@
+---
+title: "bosch_main"
+output: html_document
+---
+
+libs
+```{r libs}
+library(data.table)
+#library(h2o)
+library(zoo)
+library(FeatureHashing)
+library(Matrix)
+library(xgboost)
+library(digest)
+library(fastcluster)
+library(stringdist)
+
+```
+\
+udf   
+```{r udf}
+gc()
+sort(round(sapply(ls(),function(x){object.size(get(x))})/sum(sapply(ls(),function(x){object.size(get(x))})), 2), decreasing = T)
+
+# MCC formulas
+udf_mcc <- function(TP, FP, FN, TN) {
+    num <- (TP*TN) - (FP*FN)
+    den <- (TP+FP)*(TP+FN)*(TN+FP)*(TN+FN)
+    if (den == 0){
+      return(0)
+    }else {
+      return(num / sqrt(den))
+    }
+}
+udf_mcc <- function(y_true, y_pred) {
+  y_true <- as.numeric(y_true)
+  y_pred <- as.numeric(y_pred)
+  
+  TP <- sum(as.numeric(y_true == y_pred)[y_true == 1])
+  TN <- sum(as.numeric(y_true == y_pred)[y_true == 0])
+  FP <- sum(as.numeric(y_true != y_pred)[y_true == 1])
+  FN <- sum(as.numeric(y_true != y_pred)[y_true == 0])
+  
+  num <- (TP*TN) - (FP*FN)
+  den <- (TP+FP)*(TP+FN)*(TN+FP)*(TN+FN)
+  if (den == 0){
+    return(0)
+    }else {
+      return(num / sqrt(den))
+    }
+}
+udf_eval_mcc <- function(y_true, y_prob, show=F) {
+  y_true <- as.numeric(y_true)
+  y_prob <- as.numeric(y_prob)
+  idx <- order(y_prob)
+  y_prob_sort <- y_prob[idx]
+  y_true_sort <- y_true[idx]
+  n <- length(y_true)
+  nump <- sum(y_true)
+  numn <- n - nump
+
+  tn_v <- cumsum(y_true_sort == 0)
+  fp_v <- cumsum(y_true_sort == 1)
+  fn_v <- numn - tn_v
+  tp_v <- nump - fp_v
+  sup_v <- tp_v * tn_v - fp_v * fn_v
+  inf_v <- sqrt((tp_v + fp_v) * (tp_v + fn_v) * (tn_v + fp_v) * (tn_v + fn_v))
+  mcc_v <- sup_v/inf_v
+  mcc_v[!is.finite(mcc_v)] <- 0
+  best_id <- which.max(mcc_v)
+  best_mcc <- mcc_v[best_id]
+  best_proba <- y_prob_sort[best_id]
+
+  if (show) {
+    y_pred <- as.numeric(y_prob > best_proba)
+    #score <- udf_mcc(y_true, y_pred)
+    #cat("\n", score, best_mcc)
+    return(list(p = best_proba, mcc = best_mcc))
+  } else {
+    return(best_mcc)
+  }
+}
+mcc_eval <- function(y_prob, dtrain) {
+  y_true <- getinfo(dtrain, "label")
+  best_mcc <- udf_eval_mcc(y_true, y_prob)
+  return(list(metric="mcc", value=best_mcc))
+}
+udf_colMin <- function(dta, mx_cols) {
+  dta[, mx_i := sort(rep(1:ceiling(nrow(dta)/10000), length.out = nrow(dta)))]
+  dta[, mx_min := 0]
+  pb <- txtProgressBar(min = 1, max = max(dta$mx_i), style = 3)
+  for (mxi in unique(dta$mx_i)) {
+    dta[mx_i == mxi, 
+            mx_min := apply(dta[mx_i == mxi, mx_cols, with=F], 1, 
+                              FUN = function(x) min(x, na.rm = T))]
+    setTxtProgressBar(pb, mxi)
+    }
+  dta[is.infinite(mx_min), mx_min := NA]
+  dta[, mx_i := NULL]
+}
+udf_colMax <- function(dta, mx_cols) {
+  dta[, mx_i := sort(rep(1:ceiling(nrow(dta)/10000), length.out = nrow(dta)))]
+  dta[, mx_max := 0]
+  pb <- txtProgressBar(min = 1, max = max(dta$mx_i), style = 3)
+  for (mxi in unique(dta$mx_i)) {
+    dta[mx_i == mxi, 
+            mx_max := apply(dta[mx_i == mxi, mx_cols, with=F], 1, 
+                              FUN = function(x) max(x, na.rm = T))]
+    setTxtProgressBar(pb, mxi)
+    }
+  dta[is.infinite(mx_max), mx_max := NA]
+  dta[, mx_i := NULL]
+}
+udf_colDigest <- function(dta, mx_cols) {
+  dta[, mx_i := sort(rep(1:ceiling(nrow(dta)/10000), length.out = nrow(dta)))]
+  dta[, mx_hash := ""]
+  pb <- txtProgressBar(min = 1, max = max(dta$mx_i), style = 3)
+  for (mxi in unique(dta$mx_i)) {
+    dta[mx_i == mxi, mx_hash := apply(dta[mx_i == mxi, mx_cols, with=F], 1, 
+                                      FUN = function(x) digest(x,algo="crc32"))]
+    setTxtProgressBar(pb, mxi)
+    }
+  dta[, mx_i := NULL]
+}
+
+```
+\
+dirs
+```{r dirs}
+dir_data.raw <- "C:/kaggle/bosch/data.raw/"
+dir_data <- "C:/kaggle/bosch/data/"
+dir_out.reduced <- "C:/kaggle/bosch/data/reduced/"
+dir_out.res <- "C:/kaggle/bosch/results/"
+dir_out.models <- "C:/kaggle/bosch/models/"
+```
+\
+\
+data: train   
+```{r data}
+#rm(dta_train)
+mx_varimp <- fread(paste(dir_out.reduced, "varimp.csv", sep = ""))
+
+ctrl_bindTest <- F
+
+# categorical
+# ***********************************
+# string cat
+# *******
+if (F) {
+dir_cat.red <- paste(dir_out.reduced, "train_categorical.csv", sep = "")
+cols.cat <- fread(dir_cat.red, nrows = 5, header = T, stringsAsFactors=T)  
+cols.class.cat <- c("integer", rep("character", ncol(cols.cat)-2), "numeric") 
+length(cols.class.cat)
+
+dta_train.cat <- fread(dir_cat.red, 
+                       colClasses = cols.class.cat, 
+                       stringsAsFactors=T,
+                       sep = ",", header = T)
+}
+
+# numerized cat
+# *******
+dir_cat.red <- paste(dir_out.reduced, "train_categoricalnum.csv", sep = "")
+cols.cat <- colnames(fread(dir_cat.red, header = T, sep = ",", nrows = 1))
+#cols.cat <- cols.cat[cols.cat %in% mx_varimp$Feature]
+dta_train.cat <- fread(dir_cat.red, header = T, sep = ",", colClasses = rep("numeric", length(cols.cat)))
+
+dim(dta_train.cat)
+colnames(dta_train.cat)
+#summary(dta_train.cat)
+gc()
+
+
+# date
+# ***********************************
+dir_date.red <- paste(dir_out.reduced, "train_date.csv", sep = "")
+cols.date <- colnames(fread(dir_date.red, header = T, sep = ",", nrows = 1))
+#cols.date <- cols.date[cols.date %in% mx_varimp$Feature]
+dta_train.date <- fread(dir_date.red, sep = ",", header = T, select = cols.date,
+                        colClasses = rep("numeric", length(cols.date)))
+dim(dta_train.date)
+
+if(ctrl_bindTest) {
+  dir_date.red <- paste(dir_out.reduced, "test_date.csv", sep = "")
+  dta_train.date_test <- fread(dir_date.red, sep = ",", header = T, select = cols.date,
+                               colClasses = rep("numeric", length(cols.date)))
+  #dta_train.date[, isTr := 1]
+  #dta_train.date_test[, isTr := 0]
+  dta_train.date <- rbindlist(list(dta_train.date, dta_train.date_test))
+  rm(dta_train.date_test); gc()
+  dim(dta_train.date)
+}
+
+# replace NAs with -999
+if (F) {
+  for (i in seq_along(dta_train.date)[-1]) {
+    set(dta_train.date, i=which(is.na(dta_train.date[[i]])), j=i, value=-999)
+  }
+}
+
+# replace NAs with 0, numeric with 1 -- better
+if (T) {
+  for (i in seq_along(dta_train.date)[-1]) {
+    set(dta_train.date, i=which(!is.na(dta_train.date[[i]])), j=i, value=1)
+    set(dta_train.date, i=which(is.na(dta_train.date[[i]])), j=i, value=0)
+  }
+}
+
+dim(dta_train.date)  # 58 columns
+#colnames(dta_train.date)
+#summary(dta_train.date)
+gc()
+
+# numeric
+# ***********************************
+dir_num.red <- paste(dir_out.reduced, "train_numeric.csv", sep = "")
+cols.num <- colnames(fread(dir_num.red, nrows = 1, header = T))
+n_cols <- length(cols.num)
+cols.num <- c("Id", cols.num[cols.num %in% mx_varimp$Feature], "Response")
+
+dta_train.num <- fread(dir_num.red, sep = ",", header = T,
+                       colClasses = rep("numeric", n_cols),
+                       select = cols.num)
+dim(dta_train.num)
+
+if (ctrl_bindTest) {
+  dir_num.red <- paste(dir_out.reduced, "test_numeric.csv", sep = "")
+  dta_train.num_test <- fread(dir_num.red, sep = ",", header = T,
+                              colClasses = rep("numeric", n_cols-1),
+                              select = setdiff(cols.num, "Response"))
+  dta_train.num_test[, Response := -1]
+  dta_train.num[, isTr := 1]
+  dta_train.num_test[, isTr := 0]
+  dta_train.num <- rbindlist(list(dta_train.num, dta_train.num_test))
+  rm(dta_train.num_test); gc()
+  dim(dta_train.num)
+}
+
+# replace NAs
+for (i in seq_along(dta_train.num)) {
+  set(dta_train.num, i=which(is.na(dta_train.num[[i]])), j=i, value=-999)
+}
+
+dim(dta_train.num) # 575 columns, 223 (varimp)
+#colnames(dta_train.num)
+#summary(dta_train.num)
+
+gc()
+
+# feats: leak_1
+# ***********************************
+dir_leak_1 <- paste(dir_out.reduced, "train_test_leak_1.csv", sep = "")
+#cols.leak_1 <- colnames(fread(dir_leak_1, nrows = 1, header = T))
+dta_train.leak_1 <- fread(dir_leak_1, sep = ",", header = T)
+
+if (!ctrl_bindTest) {
+  dta_train.leak_1 <- dta_train.leak_1[isTrain == 1, c("Id", "date_min","date_max","leak_1"), with=F]
+}
+if (ctrl_bindTest) {
+  dta_train.leak_1 <- dta_train.leak_1[, c("Id", "date_min", "date_max","leak_1"), with=F]
+}
+
+dta_train.leak_1[is.na(date_min), date_min:=0]
+dta_train.leak_1[is.na(date_max), date_max:=0]
+dta_train.leak_1[, date_durat:=date_max-date_min]
+#dta_train[, date_durat:=date_max-date_min]
+
+# one hot encoding: leak_1
+if (T) {
+  dta_train.leak_1[, leak_1_1 := 0.0]
+  dta_train.leak_1[leak_1 == 1, leak_1_1 := 1.0]
+  dta_train.leak_1[, leak_1_3 := 0.0]
+  dta_train.leak_1[leak_1 == 3, leak_1_3 := 1.0]
+  dta_train.leak_1[, leak_1_4 := 0.0]
+  dta_train.leak_1[leak_1 == 4, leak_1_4 := 1.0]
+  dta_train.leak_1[, mean(leak_1 == (leak_1_1 + 3*leak_1_3 + 4*leak_1_4))] # check
+}
+
+dim(dta_train.leak_1) #5
+
+# memory breakdown:
+# ~ 6.8G
+#dta_train.num     dta_train.cat    dta_train.date
+#0.78              0.14              0.08
+
+# merge all into one data.table
+# *********
+#dta_train.date[, Response := NULL]
+# date & num
+dta_train <- merge(dta_train.num, dta_train.date, by = c("Id"))
+rm(dta_train.num, dta_train.date); gc()
+
+# cat
+if (F){
+  dta_train.cat[, Response := NULL]
+  dta_train <- merge(dta_train, dta_train.cat, by = c("Id"))
+  rm(dta_train.cat); gc()
+}
+
+# leak_1
+dta_train <- merge(dta_train, dta_train.leak_1, by = c("Id"))
+rm(dta_train.leak_1); gc()
+
+dim(dta_train) # 837
+#colnames(dta_train)
+
+```
+\
+EDA: are lines parallel?
+```{r EDA-lines}
+mx_cols <- colnames(dta_train.cat)
+mx_cols.L0 <- mx_cols[grep("L0", mx_cols)]
+
+dta_train.cat$mx_L0 <- apply(dta_train.cat[, mx_cols[grep("L0", mx_cols)], with = F], 
+                             MARGIN = 1, FUN = function(x) {sum(is.na(x) | x != "")})
+dta_train.cat$mx_L1 <- apply(dta_train.cat[, mx_cols[grep("L1", mx_cols)], with = F], 
+                             MARGIN = 1, FUN = function(x) {sum(is.na(x) | x != "")})
+dta_train.cat$mx_L2 <- apply(dta_train.cat[, mx_cols[grep("L2", mx_cols)], with = F], 
+                             MARGIN = 1, FUN = function(x) {sum(is.na(x) | x != "")})
+dta_train.cat$mx_L3 <- apply(dta_train.cat[, mx_cols[grep("L3", mx_cols)], with = F], 
+                             MARGIN = 1, FUN = function(x) {sum(is.na(x) | x != "")})
+
+dta_train.cat$mx_c <- apply(dta_train.cat[, .(mx_L0, mx_L1, mx_L2, mx_L3)], 
+                             MARGIN = 1, FUN = function(x) {sum(x != 0)})
+
+dta_train.cat$Response <- dta_train.num$Response
+
+dta_train.cat[, .(mx_L0, mx_L1, mx_L2, mx_L3, mx_c, Response)]
+
+table(dta_train.cat$mx_c)
+
+# a product can go through all lines or part of product coming via different lines, lines are not parallel
+
+unique(dta_train.cat[, mx_cols[grep("L", mx_cols)], with = F])
+dta_train.cat[, mx_cols[grep("L", mx_cols)], with = F]
+
+dta_train.cat[, mean(Response == 1 & mx_c == 0)]
+dta_train.cat[, mean(Response == 1)]
+dta_train.cat[, sum(Response == 1 & mx_c == 1)/sum(Response == 1)]
+
+dta_train.cat[Response == 1, ]
+unique(dta_train.cat$L0_S1_F25)
+
+```
+\
+EDA: plot station over time
+```{r EDA-stations}
+max_rows <- 100000
+
+# Load just the data we need for time based visualization
+cat("Reading just the data we need \n")
+
+cols.num <- colnames(fread(dir_num.red, nrows = 0, header = T))
+cols.date <- colnames(fread(dir_date.red, nrows = 0, header = T))
+cols.date <- setdiff(cols.date, "Response")
+
+# train
+dt_numeric.train <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), 
+                    nrows = max_rows, showProgress = FALSE, data.table = FALSE, 
+                    select = cols.num)
+dt_date.train <- fread(paste(dir_data.raw, "train_date.csv", sep = ""), 
+                 nrows = max_rows, showProgress = FALSE, data.table = FALSE,
+                 select = cols.date)
+dt_numeric.train$isTest <- 0
+
+# test
+dt_numeric.test <- fread(paste(dir_data.raw, "test_numeric.csv", sep = ""), 
+                    nrows = max_rows, showProgress = FALSE, data.table = FALSE,
+                    select = cols.num)
+dt_date.test <- fread(paste(dir_data.raw, "test_date.csv", sep = ""), 
+                 nrows = max_rows, showProgress = FALSE, data.table = FALSE,
+                 select = cols.date)
+dt_numeric.test$Response <- 0
+dt_numeric.test$isTest <- 1
+
+dt_numeric <- rbind(dt_numeric.train, dt_numeric.test)
+dt_date <- rbind(dt_date.train, dt_date.test)
+
+rm(dt_numeric.train, dt_date.train, dt_numeric.test, dt_date.test)
+
+response <- dt_numeric$Response
+# how many stations
+cols.num.mod <- colnames(dt_numeric)[grep("_S", colnames(dt_numeric))]
+mx_x1 <- regexpr("_S", cols.num.mod)[1:length(cols.num.mod)]
+mx_x2 <- regexpr("_F", cols.num.mod)[1:length(cols.num.mod)]
+station_list <- unique(substr(cols.num.mod, mx_x1, mx_x2))
+#station_list <- unique(substr(setdiff(names(dt_date), "Id"), 1, 5))
+
+plot_station <- function(station_id, num_idx = 1){
+  # station_id <- "L0_S0"; num_idx <- 1
+  station_date <- dt_date[, grep(station_id, names(dt_date))[1]]
+  station_parms <- names(dt_numeric)[grep(station_id, names(dt_numeric))]
+  parameter <- station_parms[num_idx]
+  mx_col <- ifelse(dt_numeric$isTest == 1, adjustcolor("blue", 0.20), 
+                   ifelse(dt_numeric$Response == 0, adjustcolor("green", 0.70), "red"))
+  plot(station_date, dt_numeric[, parameter], 
+       col = mx_col,
+       main = paste("Station ", station_id, " parameter ", parameter, " variation over time"),
+       xlab = "Station timestamp",
+       ylab = parameter,
+       pch = ifelse(response == 0, ".", "*"))
+  legend("bottomright", c("Pass", "Test", "Fail"), pch = c(".",".","*"), col = c("blue", "green", "red"))
+  print(parameter)
+}
+
+## Plot all parameters for a given station
+mx_s <- station_list[25]
+colnames(dt_date)[grep(mx_s, colnames(dt_date))]
+mx_num.cols <- grep(mx_s, colnames(dt_numeric))
+colnames(dt_numeric)[mx_num.cols]
+# length(mx_num.cols)
+for(i in 1:20){
+  plot_station(mx_s, num_idx = i)
+}
+
+
+# candidates of numeric columns to be transformed to categorical
+#"L0_S2_F56", "L0_S2_F52", "L0_S2_F40", "L0_S2_F32"
+#"L0_S3_F92", "L0_S3_F76", "L0_S3_F68", "L0_S3_F88"
+#"L0_S6_F118"
+#"L0_S8_F144"
+#"L0_S9_F205", "L0_S9_F175"
+#"L0_S10_F274", "L0_S10_F269", "L0_S10_F239"
+#"L0_S12_F338", "L0_S12_F342"
+#"L0_S14_F382", "L0_S14_F366", "L0_S14_F378", "L0_S14_F358"
+#"L0_S15_F412", "L0_S15_F409", "L0_S15_F400", "L0_S15_F394"
+#"L0_S18_F435"
+#"L0_S19_F453"
+#"L0_S20_F466", "L0_S20_F463", "L0_S20_F461"
+#"L0_S21_F507"
+#"L0_S22_F581"
+#"L0_S23_F647"
+#"L1_S24_F795", "L1_S24_F790"
+
+# weak?
+#"L0_S2_F52", "L0_S3_F88", "L0_S14_F378", "L0_S15_F409", "L0_S20_F466", "L1_S24_F761"
+#"L3_S31_F3838"
+
+summary(dta_train.num[, L1_S24_F761])
+table(dta_train.num[, L1_S24_F761])
+
+dta_train.num[L1_S24_F761 == -1, mean(Response)]
+
+
+## Plot one random parameter for each station
+for(i in station_list){
+  parm_count <- length(grep(i, names(dt_numeric)))
+  parm <- sample(parm_count, 1)
+  plot_station(i, num_idx = parm)
+}
+```
+\
+EDA: leak
+```{r EDA-leak}
+cols.cat <- colnames(fread(dir_cat.red, nrows = 0, header = T))
+cols.cat.L <- cols.cat[grep("L", cols.cat)]
+cols.num <- colnames(fread(dir_num.red, nrows = 0, header = T))
+cols.num.L <- cols.num[grep("L", cols.num)]
+cols.date <- colnames(fread(dir_date.red, nrows = 0, header = T))
+cols.date <- setdiff(cols.date, "Response")
+cols.date.L <- cols.date[grep("L", cols.date)]
+
+# date
+# ***********************************
+dir_date.red <- paste(dir_out.reduced, "train_date.csv", sep = "")
+dta_train.date <- fread(dir_date.red, sep = ",", header = T)
+dta_train.date[, isTrain := 1]
+
+dir_date.red <- paste(dir_out.reduced, "test_date.csv", sep = "")
+dta_train.date_test <- fread(dir_date.red, sep = ",", header = T)
+dta_train.date_test[, isTrain := 0]
+
+setdiff(colnames(dta_train.date), colnames(dta_train.date_test))
+dta_train.date <- rbindlist(list(dta_train.date, dta_train.date_test))
+
+dim(dta_train.date); colnames(dta_train.date); dta_train.date
+
+udf_colMin(dta_train.date, cols.date.L)
+udf_colMax(dta_train.date, cols.date.L)
+dta_train.date
+
+dta_train.date[, date_min := mx_min]
+dta_train.date[, date_max := mx_max]
+
+dta_train.date[, mx_min := NULL]
+dta_train.date[, mx_max := NULL]
+
+dta_train.date <- dta_train.date[, c("Id", "isTrain", "date_min", "date_max"), with=F]
+gc()
+
+dta_train.date
+
+
+# numeric
+# ***********************************
+dir_num.red <- paste(dir_out.reduced, "train_numeric.csv", sep = "")
+dta_train.num <- fread(dir_num.red, sep = ",", header = T)
+
+dir_num.red <- paste(dir_out.reduced, "test_numeric.csv", sep = "")
+dta_train.num_test <- fread(dir_num.red, sep = ",", header = T)
+dta_train.num_test[, Response := -1]
+gc()
+
+udf_colDigest(dta_train.num, cols.num.L)
+dta_train.num[, hashcode := mx_hash]
+dta_train.num[, mx_hash := NULL]
+dta_train.num <- dta_train.num[, c("Id","hashcode","Response"), with=F]
+gc()
+
+udf_colDigest(dta_train.num_test, cols.num.L)
+dta_train.num_test[, hashcode := mx_hash]
+dta_train.num_test[, mx_hash := NULL]
+dta_train.num_test <- dta_train.num_test[, c("Id","hashcode","Response"), with=F]
+gc()
+
+setdiff(colnames(dta_train.num), colnames(dta_train.num_test)) # no diff
+dta_train.num <- rbindlist(list(dta_train.num, dta_train.num_test))
+dta_train.num[Response == -1, Response := NA] # response from test with misc value -1, set to NA
+
+rm(dta_train.num_test); gc()
+
+# merge
+dta_train <- merge(dta_train.date, dta_train.num, by = c("Id"))
+
+dta_train[is.na(date_min), date_min := 0]
+#dta_train <- dta_train[order(date_min, Id), ]
+dta_train <- dta_train[order(Id), ]
+
+# next has identical numeric feats, same min time & consecutive Id
+dta_train[, mx_1 := (shift(hashcode, n=1, fill=NA, type="lead") == hashcode) & 
+            (shift(date_min, n=1, fill=NA, type="lead") == date_min) & 
+            (shift(Id, n=1, fill=NA, type="lead") == (Id+1)) & 
+            date_min != 0]
+dta_train[is.na(mx_1), mx_1 := F]
+
+# previous has identical numeric feats, same min time & consecutive Id
+dta_train[, mx_2 := (shift(hashcode, n=1, fill=NA, type="lag") == hashcode) & 
+            (shift(date_min, n=1, fill=NA, type="lag") == date_min) & 
+            (shift(Id, n=1, fill=NA, type="lag") == (Id-1)) & 
+            date_min != 0]
+dta_train[is.na(mx_2), mx_2 := F]
+
+# next has identical numeric feats, same min time & consecutive Id
+dta_train[, mx_3 := (shift(date_min, n=1, fill=NA, type="lead") == date_min) & 
+            (shift(Id, n=1, fill=NA, type="lead") == (Id+1)) &
+            !mx_1 & !mx_2 & 
+            date_min != 0]
+dta_train[is.na(mx_3), mx_3 := F]
+
+#
+dta_train[, mx_4 := (shift(date_min, n=1, fill=NA, type="lead") == date_min) & 
+            (shift(Id, n=1, fill=NA, type="lead") == (Id+1)) &
+            !mx_1 & !mx_3 & 
+            date_min != 0]
+dta_train[is.na(mx_4), mx_4 := F]
+
+# assign cat values
+dta_train[, leak_1 := 0]
+dta_train[mx_1==T, leak_1 := 1]
+#dta_train[mx_2==T, leak_1 := 2]
+dta_train[mx_3==T, leak_1 := 3]
+dta_train[mx_4==T, leak_1 := 4]
+
+dta_train[isTrain == 1, list(fail_rate=mean(Response), fails_cnt = sum(Response), cnt=.N), by=leak_1]
+
+dta_train <- dta_train[, c("Id","isTrain","date_min","date_max","hashcode","Response","leak_1"), with=F]
+nrow(dta_train)
+
+
+fwrite(dta_train, paste(dir_out.reduced, "train_test_leak_1.csv", sep = ""), quote = F)
+
+
+
+
+# check 1s
+# ************************************************
+
+mx_x <- table(dta_train$hashcode)
+mx_x <- mx_x[order(-mx_x)]
+head(mx_x)
+head(mx_x[mx_x == 2], 200)
+
+#mx_lab <- unlist(labels(mx_x))[mx_x == 4]
+mx_lab <- intersect(mx_lab, dta_train[Response==1, hashcode])
+
+mx_lab <- unlist(labels(mx_x))#[mx_x == 2]
+
+mx_lab <- dta_train[leak_1==0 & isTrain==1, date_min]
+mx_lab <- intersect(mx_lab, dta_train[leak_1==0 & isTrain==1 & Response==1, Id])
+
+mx_hash <- dta_train[leak_1==0 & isTrain==1 & Response==1, hashcode]
+to_head <- dta_train[hashcode %in% mx_hash & hashcode != "1088924f", ]
+
+mx_time <- dta_train[leak_1==0 & isTrain==1 & Response==1, date_min]
+to_head <- dta_train[date_min %in% mx_time & date_min != 0, ]
+
+mx_id <- dta_train[leak_1==0 & isTrain==1 & Response==1, Id]
+mx_id <- c(mx_id, mx_id+1, mx_id-1)
+to_head <- dta_train[Id %in% mx_id, ]
+
+to_head <- to_head[isTrain==1, ]
+
+to_head <- to_head[order(Id), ]
+to_head <- to_head[order(date_min), ]
+to_head <- to_head[order(hashcode), ]
+
+head(to_head, 50)
+tail(to_head, 50)
+nrow(to_head)
+
+# 36/2812 # 4 dup rows
+# 291/17730 # 3 dup rows
+# 5694/158762 # 2 dup rows
+
+
+```
+
+\
+first model on raw data (no features)    
+```{r 1st_model}
+# ********************************************************
+h2o.init(nthreads=-1, max_mem_size="16G")
+h2o.removeAll() ## clean slate - just in case the cluster was already running
+
+mx_Xs <- colnames(dta_train)[grep("L", colnames(dta_train))]
+dta_train[, fold.val := 1:nrow(dta_train) %% 2]
+dta_train[, y := as.factor(Response)]
+gc()
+dta_train.h2o <- as.h2o(dta_train[fold.val == 0, c("y", mx_Xs), with = F], 
+                        destination_frame = "dta_train.h2o")
+
+dta_train <- dta_train[fold.val == 1, ]
+gc()
+
+dta_valid.h2o <- as.h2o(dta_train[fold.val == 1, c("y", mx_Xs), with = F], 
+                        destination_frame = "dta_valid.h2o")
+rm(dta_train); gc()
+
+fit.rf <- h2o.randomForest(x = mx_Xs, y = "y", 
+                           training_frame = dta_train.h2o, model_id = "rf.1", 
+                           validation_frame = dta_valid.h2o, ntrees = 250, max_depth = 10, 
+                           score_tree_interval = 20)
+
+fit.gbm <- h2o.gbm(x = mx_Xs, y = "y", 
+                   training_frame = dta_train.h2o, model_id = "gbm.1", 
+                   validation_frame = dta_valid.h2o, ntrees = 100, max_depth = 10, 
+                   score_tree_interval = 10)
+
+h2o.saveModel(fit.gbm, path = dir_out.models, force = T)
+h2o.saveModel(fit.rf, path = dir_out.models, force = T)
+
+# h2o.mcc(fit.rf, thresholds = seq(0.10, 1, 0.01))
+#h2o.confusionMatrix(fit.gbm)
+
+dta_train.num[, mean(Response), by = fold.val]
+
+fit.rf <- h2o.loadModel(paste(dir_out.models, "rf.1", sep=""))
+
+
+```
+\
+xgboost on raw data
+```{r xgb_raw}
+
+mx_Xs <- colnames(dta_train)[grep("L", colnames(dta_train))]
+#mx_Xs <- c(mx_Xs, "pred.xgb.date.1")
+mx_Xs <- c(mx_Xs, "id.Id_Date.min")
+# <- mx_varimp[Gain > 0.0001, Feature]
+
+#mx_Xs <- paste(cols.date[grep("L", cols.date)], ".1", sep = "")
+dta_train[, fold.val := 1:nrow(dta_train) %% 2]
+#dta_train[, y := as.factor(Response)]
+dta_train[, y := as.numeric(Response)]
+
+# dense matrix
+rm(dta_xgb.train, dta_xgb.valid); gc()
+dta_xgb.train <- xgb.DMatrix(data = as.matrix(dta_train[fold.val == 0, mx_Xs, with = F]), 
+                             label = as.matrix(dta_train[fold.val == 0, "y", with = F]), 
+                             missing = NaN)
+gc()
+dta_xgb.valid <- xgb.DMatrix(data = as.matrix(dta_train[fold.val == 1, mx_Xs, with = F]), 
+                             label = as.matrix(dta_train[fold.val == 1, "y", with = F]), 
+                             missing = NaN)
+gc()
+
+# sparse matrix
+if (F) {
+  dta_train.train <- dta_train[fold.val==0, c(mx_Xs,"y"), with=F]
+  dta_train.valid <- dta_train[fold.val==1, c(mx_Xs,"y"), with=F]
+  rm(dta_train); gc()
+  #dta_xgb.train <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train[fold.val==0, c(mx_Xs,"y"), with=F]))
+  dta_xgb.train <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train.train))
+  # label = as.numeric(dta_train.train$y)
+  #rm(dta_train.train); gc()
+  #dta_xgb.valid <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train[fold.val==1, c(mx_Xs,"y"), with=F]))
+  dta_xgb.valid <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train.valid))
+  #rm(dta_train.valid); gc()
+}
+#rm(dta_xgb.train, dta_xgb.valid); gc()
+#rm(dta_train.train, dta_train.valid); gc()
+
+
+par_scaleposw <- dta_train[fold.val == 0, sum(Response == 0)/sum(Response == 1)]
+param <- list(objective = "binary:logistic",
+              eval_metric = "auc",
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              max_depth = 8,
+              scale_pos_weight = par_scaleposw,
+              eta = 0.025)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 25,
+                     watchlist = list(train = dta_xgb.train, valid = dta_xgb.valid),
+                     print_every_n = 10, 
+                     nthread = 8)
+
+dta_train[, pred.xgb := -1]
+dta_train[fold.val == 0, pred.xgb := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_train[fold.val == 1, pred.xgb := round(predict(fit.xgb, dta_xgb.valid), 5)]
+
+
+#
+mx_x <- dta_train[, udf_eval_mcc(as.numeric(Response), pred.xgb, T), by = fold.val]
+mx_x
+dta_train[, list(mcc = udf_mcc(as.numeric(Response), (pred.xgb > mx_x[fold.val==1, p])*1)), by = fold.val]
+
+# auc 0.7240 (eta=0.10)
+#   fold.val       p       mcc
+#1:        1 0.91456 0.2594148
+#2:        0 0.91023 0.2787506
+
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+
+plot.zoo(mx_varimp$Gain, type = "h")
+plot.zoo(mx_varimp$Cover, type = "h")
+
+mx_varimp[Gain > 0.001, Feature]
+
+
+dta_train[, pred.xgb.date.1 := pred.xgb]
+
+```
+\
+xgboost on raw data + leak_1
+```{r xgb_raw+leak}
+#cols.cat <- colnames(fread(dir_cat.red, nrows = 0, header = T))
+cols.cat.L <- cols.cat[grep("L", cols.cat)]
+cols.date.L <- cols.date[grep("L", cols.date)]
+cols.num.L <- cols.num[grep("L", cols.num)]
+
+# which Xs
+# ******
+mx_Xs <- c()
+#mx_Xs <- colnames(dta_train)[grep("L", colnames(dta_train))]
+#mx_Xs <- c(mx_Xs, cols.cat.L)
+mx_Xs <- c(mx_Xs, cols.date.L)
+mx_Xs <- c(mx_Xs, cols.num.L)
+#mx_Xs <- c(mx_Xs, cols.num.L_varimp)
+mx_Xs <- c(mx_Xs, c("date_min", "date_max", "date_durat"))
+#mx_Xs <- c(mx_Xs, c("L3_S32_D3852", "L3_S33_D3856", "L3_S34_D3875"))
+#mx_Xs <- c(mx_Xs, "pred.xgb_cat_num_date", "pred.xgb_cat", "pred.xgb_num", "pred.xgb_date")
+#mx_Xs <- c(mx_Xs, "id.Id_Date.min")
+#mx_Xs <- mx_varimp$Feature
+mx_Xs <- c(mx_Xs, c("leak_1_1", "leak_1_3", "leak_1_4"))
+#mx_Xs <- c(mx_Xs, "pred.xgb_cat_num_date")
+
+
+# train & test
+#dta_train[, fold.val := 1*(1:nrow(dta_train) %in% sample(1:nrow(dta_train), round(nrow(dta_train)/2,0)))]
+dta_train[, fold.val := 1:nrow(dta_train) %% 2]
+#dta_train[, y := as.factor(Response)]
+
+if (F) {
+  dta_train[, fold.val := 0]
+  dta_train[isTr==0, fold.val := 1]
+}
+
+# target
+dta_train[, y := as.numeric(Response)]
+
+# XGB dense matrix
+if (exists("dta_xgb.train") | exists("dta_xgb.valid")) { rm(dta_xgb.train, dta_xgb.valid); gc() }
+dta_xgb.train <- xgb.DMatrix(data = as.matrix(dta_train[fold.val == 0, mx_Xs, with = F]), 
+                             label = as.matrix(dta_train[fold.val == 0, "y", with = F]), 
+                             missing = -999)
+gc()
+dta_xgb.valid <- xgb.DMatrix(data = as.matrix(dta_train[fold.val == 1, mx_Xs, with = F]), 
+                             label = as.matrix(dta_train[fold.val == 1, "y", with = F]), 
+                             missing = -999)
+gc()
+
+summary(dta_train[fold.val == 0, mx_Xs, with = F])
+
+# sparse matrix
+if (F) {
+  dta_train.train <- dta_train[fold.val==0, c(mx_Xs,"y"), with=F]
+  dta_train.valid <- dta_train[fold.val==1, c(mx_Xs,"y"), with=F]
+  rm(dta_train); gc()
+  #dta_xgb.train <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train[fold.val==0, c(mx_Xs,"y"), with=F]))
+  dta_xgb.train <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train.train))
+  # label = as.numeric(dta_train.train$y)
+  #rm(dta_train.train); gc()
+  #dta_xgb.valid <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train[fold.val==1, c(mx_Xs,"y"), with=F]))
+  dta_xgb.valid <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data=dta_train.valid))
+  #rm(dta_train.valid); gc()
+}
+#rm(dta_xgb.train, dta_xgb.valid); gc()
+#rm(dta_train.train, dta_train.valid); gc()
+
+par_scaleposw <- dta_train[fold.val == 0, sum(Response == 0)/sum(Response == 1)]
+param <- list(objective = "binary:logistic",
+              eval_metric = "auc",
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              #colsample_bytree = 0.9,
+              #subsample = 0.7,
+              max_depth = 7,
+              scale_pos_weight = par_scaleposw,
+              eta = 0.10)
+
+fit.xgb <- xgb.train(data = dta_xgb.train,
+                     param, 
+                     nrounds = 20,
+                     #watchlist = list(train = dta_xgb.train, valid = dta_xgb.valid),
+                     watchlist = list(train = dta_xgb.train),
+                     nthread = 8)
+
+dta_train[, pred.xgb := -1]
+dta_train[fold.val == 0, pred.xgb := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_train[fold.val == 1, pred.xgb := round(predict(fit.xgb, dta_xgb.valid), 5)]
+
+isStacking <- T
+if (isStacking) {
+  fit.xgb_valid <- xgb.train(data = dta_xgb.valid,
+                     param, 
+                     nrounds = 20,
+                     watchlist = list(train = dta_xgb.valid, valid = dta_xgb.train),
+                     nthread = 8)
+  dta_train[fold.val == 0, pred.xgb := round(predict(fit.xgb_valid, dta_xgb.train), 5)]
+}
+
+# 
+if (F) {
+  dta_train[, pred.xgb_cat_num_date := pred.xgb]
+}
+
+
+# gc()
+mx_x <- dta_train[, udf_eval_mcc(as.numeric(Response), pred.xgb, T), by = fold.val]
+mx_x
+dta_train[, list(mcc = udf_mcc(as.numeric(Response), (pred.xgb > mx_x[fold.val==0, p])*1)), by = fold.val]
+
+# 0.3585 (max_depth=9, eta=0.10, nrounds=50)
+
+# auc 0.7240 (eta=0.10)
+#   fold.val       p       mcc
+#1:        1 0.91456 0.2594148
+#2:        0 0.91023 0.2787506
+
+# auc=0.892 (max_depth=8, eta=0.05, nrounds=50)
+#   fold.val       p       mcc
+#1:        0 0.85795 0.3702951
+#2:        1 0.88093 0.3471552
+
+
+mx_varimp <- xgb.importance(feature_names = mx_Xs, model = fit.xgb)
+#mx_varimp <- xgb.importance(model = fit.xgb)
+
+if (F) {
+  fwrite(mx_varimp, paste(dir_out.reduced, "varimp.csv", sep = ""))
+}
+
+
+xgb.plot.importance(mx_varimp[1:25, ])
+xgb.plot.importance(mx_varimp[mx_varimp$Feature %in% cols.num.L, ])
+xgb.plot.importance(mx_varimp[mx_varimp$Feature %in% cols.date.L, ])
+xgb.plot.importance(mx_varimp[mx_varimp$Feature %in% c("leak_1_1", "leak_1_3", "leak_1_4"), ])
+
+mx_Xs
+
+dta_train[, list(cnt_Fails = sum(Response), cnt=.N, fail_rate=mean(Response)), 
+          by=c("L3_S32_D3852", "L3_S33_D3856", "L3_S34_D3875", "leak_1_3")]
+
+mx_x <- dta_train[, list(cnt_Fails = sum(Response), cnt=.N, fail_rate=mean(Response)), 
+          by=setdiff(cols.date.L, c("L3_S32_D3852", "L3_S33_D3856", "L3_S34_D3875", 
+                                    "L3_S37_D3942", "L3_S46_D4135", "L3_S47_D4140", "L3_S48_D4194",
+                                    "L3_S49_D4208", "L3_S50_D4242", "L3_S51_D4255",
+                                    "L3_S43_D4062", "L3_S44_D4101", "L3_S45_D4125",
+                                    "L3_S39_D3966", "L3_S40_D3981", "L3_S41_D3997", "L3_S42_D4029",
+                                    "L3_S36_D3919", "L3_S39_D3966", "L3_S31_D3836", "L3_S30_D3496",
+                                    "L2_S28_D3223", "L3_S29_D3316", 
+                                    "L1_S25_D2230", "L1_S25_D2497", "L1_S25_D2780", "L1_S25_D1854",
+                                    "L1_S24_D677",  "L1_S24_D1511", 
+                                    "L0_S21_D469", "L0_S22_D543", "L0_S23_D617", 
+                                    "L0_S17_D432", "L0_S18_D437", "L0_S19_D454", "L0_S20_D462",
+                                    "L0_S14_D360",  "L0_S15_D395",  "L0_S16_D423",
+                                    "L0_S10_D216", "L0_S11_D280",  "L0_S12_D331",  "L0_S13_D355", 
+                                    "L0_S7_D137", "L0_S8_D145", "L0_S9_D152", 
+                                    "L0_S0_D1", "L0_S1_D26","L0_S2_D34", "L0_S3_D70","L0_S4_D106","L0_S5_D115"  
+                                    ))]
+
+mx_x <- dta_train[, list(cnt_Fails = sum(Response), cnt=.N, fail_rate=mean(Response)), 
+          by = c("L0_S6_D120", "L1_S24_D1116", "L2_S26_D3037", "L2_S27_D3130", "L3_S35_D3886", "L3_S38_D3953")]
+
+# "L3_S38_D3953", 
+# L3_S35_D3886
+# "L2_S26_D3037" "L2_S27_D3130"
+# "L1_S24_D1116", 
+# "L0_S6_D120"
+
+mx_x <- mx_x[cnt_Fails > 5 & fail_rate > 0.01, ]
+mx_x <- mx_x[cnt > 100 & fail_rate < 0.00001, ]
+
+
+plot.zoo(mx_x[cnt_Fails > 10, fail_rate], type = "h")
+
+
+"L3_S32_D3852" %in% cols.date.L
+"L3_S32_D3852" %in% colnames(dta_train)
+"L3_S32_D3852" %in% mx_Xs
+
+sort(as.numeric(mx_varimp$Feature))
+
+getinfo(dta_xgb.valid, mx_varimp$Feature[1])
+
+str(dta_xgb.valid)
+
+#cols.num.L_varimp <- mx_varimp$Feature[1:round(0.50*nrow(mx_varimp),0)]
+
+plot.zoo(mx_varimp$Gain, type = "h")
+plot.zoo(mx_varimp$Cover, type = "h")
+
+mx_varimp[Gain > 0.001, Feature]
+
+```
+\
+```{r submit}
+
+# choose cutoff to have the same positive rate in predictions as in train data: ~ 0.0058
+dta_train[isTr == 0, Response := ifelse(pred.xgb > 0.886, 1, 0)]
+dta_train[, mean(Response), by = isTr]
+
+fwrite(dta_train[isTr == 0, .(Id, Response)], 
+       paste("C:/kaggle/bosch/submits/", "submit5.csv", sep = ""))
+
+```
+\
+```{r model_each_station}
+h2o.init(nthreads=-1, max_mem_size="16G")
+h2o.removeAll() ## clean slate - just in case the cluster was already running
+
+cols.num <- colnames(dta_train.num)
+cols.cat <- colnames(dta_train.cat)
+
+# how many stations
+cols.date.mod <- colnames(dta_train.date)[grep("_S", colnames(dta_train.date))]
+mx_x1 <- regexpr("_S", cols.date.mod)[1:length(cols.date.mod)]
+mx_x2 <- regexpr("_D", cols.date.mod)[1:length(cols.date.mod)]
+mx_stations <- unique(substr(cols.date.mod, mx_x1, mx_x2))
+mx_stations
+length(mx_stations)
+
+s <- "_S24_"
+dta_s <- dta_train.num[, c("Id", cols.num[grep(s, cols.num)], "Response"), with = F]
+dim(dta_s)
+dta_s <- merge(dta_s,
+               dta_train.date[, c("Id", cols.date.mod[grep(s, cols.date.mod)]), with = F], by = "Id")
+dim(dta_s)
+
+#dta_s <- merge(dta_s, 
+#               dta_train.cat[, c("Id", cols.cat[grep(s, cols.cat)]), with = F], by = "Id")
+#dim(dta_s)
+
+mx_Xs <- colnames(dta_s)[grep("L", colnames(dta_s))]
+dta_s[, fold.val := 1:nrow(dta_s) %% 2]
+#dta_s[, y := as.factor(Response)]
+dta_s[, y := as.numeric(Response)]
+
+dta_xgb.train <- xgb.DMatrix(data = as.matrix(dta_s[fold.val == 0, mx_Xs, with = F]), 
+                             label = as.matrix(dta_s[fold.val == 0, "y", with = F]), 
+                             missing = NaN)
+dta_xgb.valid <- xgb.DMatrix(data = as.matrix(dta_s[fold.val == 1, mx_Xs, with = F]), 
+                             label = as.matrix(dta_s[fold.val == 1, "y", with = F]), 
+                             missing = NaN)
+
+#dta_xgb.train <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data = dta_s[fold.val == 0, c(mx_Xs, "y"), with = F]))
+#dta_xgb.valid <- xgb.DMatrix(data = sparse.model.matrix(y~.-1, data = dta_s[fold.val == 1, c(mx_Xs, "y"), with = F]))
+
+par_scaleposw <- dta_s[fold.val == 0, sum(Response == 0)/sum(Response == 1)]
+param <- list(objective = "binary:logistic",
+              eval_metric = "auc",
+              #eval_metric = mcc_eval,
+              #booster = "gblinear",
+              scale_pos_weight = par_scaleposw,
+              eta = 0.05)
+
+fit.xgb <- xgb.train(data = dta_xgb.train, param, nrounds = 100,
+                     watchlist = list(train = dta_xgb.train, valid = dta_xgb.valid),
+                     print_every_n = 10, nthread = 8)
+
+dta_s[, pred.xgb := -1]
+dta_s[fold.val == 0, pred.xgb := round(predict(fit.xgb, dta_xgb.train), 5)]
+dta_s[fold.val == 1, pred.xgb := round(predict(fit.xgb, dta_xgb.valid), 5)]
+
+dta_s[, udf_eval_mcc(as.numeric(Response), pred.xgb, T), by = fold.val]
+dta_s[, udf_mcc(as.numeric(Response), (pred.xgb > 0.83)*1), by = fold.val]
+
+
+
+udf_mcc(dta_s$Response, dta_s$pred.xgb.1)
+
+
+```
+
+\
+features-min(time)
+```{r}
+cols.date.L <- cols.date[grep("L", cols.date)]
+
+dta_train[, time.min := 99999999]
+dta_train[, mx_i := rep(1:100, length.out = nrow(dta_train))]
+for (mxi in 1:100) {
+  dta_train[mx_i == mxi, 
+            time.min := apply(dta_train[mx_i == mxi, cols.date.L, with=F], 1, FUN = function(x) min(x, na.rm = T))]
+}
+sum(is.infinite(dta_train$time.min)) #582
+dta_train[is.infinite(time.min), time.min := 0]
+
+# order by time & Id
+setorder(dta_train, time.min, Id)
+dta_train[, id.Id_Date.min := 1:nrow(dta_train)]
+tail(dta_train[y==1, .(id.Id_Date.min, time.min, Id, fold.val, y)], 99)
+
+```
+\
+features - hclust
+```{r}
+#
+cols.date.L <- cols.date[grep("L", cols.date)]
+#dta_sub <- dta_train[fold.val == 0 & Response == 1, cols.date, with = F]
+
+# time difference between first and last timestamp
+# ********************************
+if (F) {
+  dta_sub$timediff <- apply(dta_train[, cols.date.L, with=F], 1, 
+                            FUN = function(x) max(x,na.rm = T) - min(x,na.rm = T))
+  dta_sub[is.infinite(timediff), timediff :=  3.55]
+  summary(dta_sub$timediff)
+  
+  # Response 1
+  # Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  # 0.00    1.64    3.55   10.78   10.86  373.90
+  # Response 0
+  #   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+  # 0.00    1.72    3.68   10.75   11.85  699.20
+}
+# not a feature
+
+
+# cluster by station
+# ******************************
+dta_sub <- dta_train[, cols.date.L, with = F] # fold.val == 0 & Response == 1
+dta_sub[!is.na(dta_sub)] <- 1
+dta_sub[is.na(dta_sub)] <- 0
+
+if (F) {
+dta_sub[, Id := dta_train$Id]
+dta_train <- merge(dta_train, dta_sub, by = "Id", suffixes = c("", ".1"), all = T)
+rm(dta_sub); gc()
+}
+
+dim(dta_train)
+dim(dta_sub)
+
+
+dta_sub[, path_s_date := 
+          apply(dta_sub[, cols.date.L, with = F], 1, FUN = function(x) paste(x, sep="", collapse = ""))]
+
+dta_train[, path_s_date := dta_sub[, "path_s_date", with = F]]
+
+
+# 
+mx_x <- dta_train[fold.val == 0 , 
+                  list(count = .N, errorCount = sum(Response), errorRate = mean(Response)), 
+                  by = "path_s_date"]
+# 
+mx_x <- mx_x[order(-count), ]
+plot.zoo(as.zoo(mx_x[errorCount > 0 | count > 100, .(errorRate, errorCount, count)]), type = "h")
+plot(cumsum(mx_x$count)/sum(mx_x$count), type = "l")
+
+mx_x <- mx_x[order(-errorCount), ]
+plot.zoo(as.zoo(mx_x[errorCount > 0 | count > 100, .(errorRate, errorCount, count)]), type = "h")
+plot(cumsum(mx_x$count)/sum(mx_x$count), type = "l")
+
+mx_x <- mx_x[order(-errorRate), ]
+plot.zoo(as.zoo(mx_x[errorCount > 0 | count > 100, .(errorRate, errorCount, count)]), type = "h")
+
+mx_x$countnorm <- mx_x$count/sum(mx_x$count)
+quantile(mx_x$count, c(0.50, 0.75, 0.90, 0.95, 0.98, 0.99))
+
+# clusterize
+mx_clust <- hclust(dist(as.data.frame(mx_x[, .(path_s_date, errorRate)])), method = "ward.D")
+plot(mx_clust)
+
+mx_clustCut <- cutree(mx_clust, 20)
+
+#table(mx_clustCut, round(mx_x$countnorm, 3))
+#table(mx_clustCut, round(mx_x$errorRate, 3))
+
+mx_x$cluster <- mx_clustCut
+mx_x <- mx_x[order(-count), ]
+mx_x[, list(err.m = mean(errorRate), errcnt.m = mean(errorCount), obs = sum(count), N=.N), by = "cluster"]
+
+#merge(dta_train, mx_x[, .(path_s_date, cluster)]
+? hclust
+
+c("0000000000000000000000000010000010011001101100000000000000")
+
+install.packages("stringdist")
+
+
+
+# cluster by path name
+
+hclust(stringdistmatrix(mx_x$path_s_date[1:10]))
+
+mx_clust <- stats::hclust(stringdistmatrix(mx_x$path_s_date))
+mx_clustCut <- cutree(mx_clust, 5)
+plot(mx_clust)
+mx_clustCut <- cutree(mx_clust, 100)
+mx_x$c_path <- mx_clustCut
+mx_x <- mx_x[order(-count), ]
+mx_smry <- mx_x[, list(err.m = sum(errorCount)/sum(count), err.max = max(errorRate), 
+                       errcnt.m = mean(errorCount), obs = sum(count), N=.N), by = "c_path"]
+plot.zoo(zoo(mx_smry[, .(err.max, err.m, obs)]), 
+         type = c("l", "h", "h"), col = c("grey", "red", "black"),
+         screens = c(1,1,2))
+
+
+# clusterize
+mx_clust <- hclust(dist(mx_x[, .(c_path, errorRate)]), method = "ward.D")
+plot(mx_clust)
+
+mx_clustCut <- cutree(mx_clust, 100)
+
+mx_x$c_path_err <- mx_clustCut
+mx_x <- mx_x[order(-count), ]
+mx_smry <- mx_x[, list(err.m = sum(errorCount)/sum(count), err.max = max(errorRate), 
+                       errcnt.m = mean(errorCount), obs = sum(count), N=.N), by = "c_path_err"]
+plot.zoo(zoo(mx_smry[, .(err.max, err.m, obs)]), 
+         type = c("l", "h", "h"), col = c("grey", "red", "black"),
+         screens = c(1,1,2))
+
+
+
+
+```
+
+features:
+- mean error rate by station := #ones/ #tags
+- mean/max/quantile of numeric features by station
+- value respective to mean (extreme numeric values predict errors?)
+- time between stations, total time (last timestamp - first timestamp)
+- different aggregations (e.g. Station 32 is even more powerful if you combine it with S33 and S34.)
+
+-ensembling
+- blend: GBM + NN
+- logistic regression used in blending
+

@@ -1,0 +1,940 @@
+---
+title: "bosch_dups&NAs"
+output: html_document
+---
+
+libs
+```{r libs}
+library(data.table)
+#library(h2o)
+library(zoo)
+library(FeatureHashing)
+library(Matrix)
+library(xgboost)
+library(digest)
+
+library(corrplot)
+library(caret)
+
+```
+\
+udf   
+```{r udf}
+gc()
+sort(round(sapply(ls(),function(x){object.size(get(x))})/sum(sapply(ls(),function(x){object.size(get(x))})), 2), decreasing = T)
+
+udf_quantile <- function(x, p = c(0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25, 0.5, 0.75, 0.90, 0.95, 0.98, 0.99, 0.995, 1))
+{
+  return(quantile(x, probs = p, na.rm = T))
+}
+udf_colMin <- function(dta, mx_cols) {
+  dta[, mx_i := sort(rep(1:ceiling(nrow(dta)/10000), length.out = nrow(dta)))]
+  dta[, mx_min := 0]
+  pb <- txtProgressBar(min = 1, max = max(dta$mx_i), style = 3)
+  for (mxi in unique(dta$mx_i)) {
+    dta[mx_i == mxi, 
+            mx_min := apply(dta[mx_i == mxi, mx_cols, with=F], 1, 
+                              FUN = function(x) min(x, na.rm = T))]
+    setTxtProgressBar(pb, mxi)
+    }
+  dta[is.infinite(mx_min), mx_min := NA]
+  dta[, mx_i := NULL]
+}
+udf_colMax <- function(dta, mx_cols) {
+  dta[, mx_i := sort(rep(1:ceiling(nrow(dta)/10000), length.out = nrow(dta)))]
+  dta[, mx_max := 0]
+  pb <- txtProgressBar(min = 1, max = max(dta$mx_i), style = 3)
+  for (mxi in unique(dta$mx_i)) {
+    dta[mx_i == mxi, 
+            mx_max := apply(dta[mx_i == mxi, mx_cols, with=F], 1, 
+                              FUN = function(x) max(x, na.rm = T))]
+    setTxtProgressBar(pb, mxi)
+    }
+  dta[is.infinite(mx_max), mx_max := NA]
+  dta[, mx_i := NULL]
+}
+
+```
+\
+dirs
+```{r}
+dir_data.raw <- "C:/kaggle/bosch/data.raw/"
+dir_data <- "C:/kaggle/bosch/data/"
+dir_out.reduced <- "C:/kaggle/bosch/data/reduced/"
+isDo <- F
+```
+\
+The features were originally in one big file and located next to each other (L0_S0_F0, L0_S0_D1...). We decided to break up the file make handling them easier.
+
+#Eliminate duplicate and all-NA columns
+##categorical
+- reduce duplicate and all-NA columns   
+- reduce categorical columns that have <=2 observations != "" and response = 0
+```{r cat}
+dir_in <- paste(dir_data.raw, "train_categorical.csv", sep = "")
+dir_out <- paste(dir_data, "feat_summary_cat.csv", sep = "")
+
+# reduce duplicate and all-NA columns
+# ************************************************************************************
+isDo <- F
+if (isDo) {
+  cols.cat <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""), nrows = 0, header = T)  
+  cols.cat <- colnames(cols.cat)
+
+  n_batch  <- 5
+  col_idx  <- c(1:length(cols.cat))
+  col_bat  <- cut(col_idx, n_batch, labels = c(1:n_batch))
+
+  all_features <- vector("list", n_batch)
+  all_digests  <- vector("list", n_batch)
+  all_isNA  <- vector("list", n_batch)
+
+  for(i in seq_along(all_features)) {
+  print(i)
+  dt <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""),
+              colClasses = "character", na.strings = "", 
+              showProgress = F, select = col_idx[col_bat == i])
+  all_features[[i]] <- names(dt)
+  all_digests[[i]]  <- lapply(dt, digest)
+  all_isNA[[i]]  <- lapply(dt, FUN=function(x){mean(is.na(x))})
+  rm(dt)
+  }
+
+  feature_summary <- data.table(feature = unlist(all_features), digest  = unlist(all_digests), 
+                              isNA = unlist(all_isNA))
+  feature_summary$duplicate <- duplicated(feature_summary$digest)
+  write.csv(feature_summary, paste(dir_data, "feat_summary_cat.csv", sep = ""), quote = F, row.names = F)
+}
+
+feature_summary <- fread(dir_out, sep = ",")
+feature_summary[, list(all = .N, dup = sum(duplicate), isNA = sum(isNA == 1), uniq = sum(!duplicate))]
+feature_summary
+
+# unique columns
+cols.cat.uniq <- feature_summary[!duplicate & isNA < 1, feature]
+
+# read categorical data again, only non-dup columns
+cols.cat <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""), nrows = 1, header = T)  
+cols.class.cat <- c("integer", rep.int("character", ncol(cols.cat)-1)) 
+
+# ~ 30s
+dta_train.cat <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""), header = T, 
+                       colClasses = cols.class.cat, 
+                       #na.strings = "",
+                       select = cols.cat.uniq, sep = ",")
+
+# append Response to date data
+if (T) {
+  dta_train.num <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), 
+                       sep = ",", header = T,
+                       select = c("Id", "Response"))
+  dta_train.cat$Response <- dta_train.num$Response
+}
+dim(dta_train.cat)
+colnames(dta_train.cat)
+
+# reduced:
+1-(length(cols.cat.uniq)-1)/(nrow(feature_summary)-1)
+# 0.8943925
+
+# write out categorical data to reduced file
+fwrite(dta_train.cat, paste(dir_out.reduced, "train_categorical.csv", sep = ""), quote = F)
+
+# feature_summaryX <- feature_summary
+
+# reduce categorical columns that have <= 2 observations != "" and response = 0
+# ***********************************************************************************************
+if (isDo) {
+  feature_summary$tagCount <- NA
+  feature_summary$resp1Count <- NA
+  mx_cols <- setdiff(colnames(dta_train.cat), c("Id", "Response"))
+
+  for (mx_i in 1:nrow(feature_summary)) {
+    mx_col <- feature_summary$feature[mx_i]
+    print(mx_col)
+    print((mx_col %in% mx_cols))
+    if (mx_col %in% mx_cols) {
+      feature_summary$tagCount[mx_i] <- sum(dta_train.cat[, mx_col, with = F] != "")
+      feature_summary$resp1Count[mx_i]<- sum(dta_train.cat[, mx_col, with = F] != "" & dta_train.cat[, Response == 1])
+    }
+    }
+  write.csv(feature_summary, paste(dir_data, "feat_summary_cat.csv", sep = ""), quote = F, row.names = F)
+}
+
+feature_summary[resp1Count > 0, ]
+feature_summary[tagCount <= 2, ]
+
+# unique columns
+cols.cat.uniq <- feature_summary[(!duplicate & isNA < 1) & !(tagCount <= 2 & resp1Count == 0), feature]
+cols.cat.uniq <- unique(c("Id", cols.cat.uniq, "Response"))
+
+
+dta_train.cat <- dta_train.cat[, cols.cat.uniq, with = F]
+gc()
+
+# reduced:
+1-(ncol(dta_train.cat) - 2)/(nrow(feature_summary) - 1)
+# 0.8943925
+ncol(dta_train.cat) - 2; nrow(feature_summary) - 1
+# keep only 202 from 2140
+
+# write out categorical data to reduced file
+# ~ 1s
+fwrite(dta_train.cat, paste(dir_out.reduced, "train_categorical.csv", sep = ""), quote = F)
+
+
+# reduce test data
+# **********************************************************************************
+dta_train.cat <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 5)
+cols.class.cat <- c("integer", rep.int("character", ncol(dta_train.cat)-1))
+
+dta_train.cat <- fread(paste(dir_out.reduced, "train_categorical.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 5)
+cols.cat.uniq <- colnames(dta_train.cat)
+cols.cat.uniq <- setdiff(cols.cat.uniq, "Response")
+
+dta_train.cat <- fread(paste(dir_data.raw, "test_categorical.csv", sep = ""), 
+                       sep = ",", header = T, select = cols.cat.uniq, 
+                       colClasses = cols.class.cat)
+
+fwrite(dta_train.cat, paste(dir_out.reduced, "test_categorical.csv", sep = ""), quote = F)
+
+
+# create dictionary for categorigal values encountered in categorical data
+# ***********************************************************************************************
+# https://www.kaggle.com/rdslater/bosch-production-line-performance/looking-at-categorical-data/notebook
+# read data
+feature_summary <- fread(dir_out, sep = ",")
+cols.cat <- fread(paste(dir_out.reduced, "train_categorical.csv", sep = ""), nrows = 1, header = T)  
+cols.class.cat <- c("integer", rep.int("character", ncol(cols.cat)-1))
+if ("Response" %in% colnames(cols.cat)) {cols.class.cat[length(cols.class.cat)] <- "numeric"}
+dta_train.cat <- fread(paste(dir_out.reduced, "train_categorical.csv", sep = ""), header = T,
+                       colClasses = cols.class.cat,
+                       na.strings = "",
+                       sep = ",")
+
+dta_train.cat_test <- fread(paste(dir_out.reduced, "test_categorical.csv", sep = ""), header = T,
+                       colClasses = cols.class.cat[-length(cols.class.cat)],
+                       na.strings = "",
+                       sep = ",")
+dta_train.cat_test[, Response := 0]
+
+dta_train.cat[, isTrain := 1]
+dta_train.cat_test[, isTrain := 0]
+
+dta_train.cat <- rbindlist(list(dta_train.cat, dta_train.cat_test))
+rm(dta_train.cat_test); gc()
+
+# count how many different values for each column
+if (isDo) {
+feature_summary$coundDiffVals <- NA
+
+mx_cols <- setdiff(colnames(dta_train.cat), c("Id", "Response", "isTrain"))
+mx_val <- data.frame(val = NA)
+mx_val.1 <- data.frame(val = NA)
+
+for (mx_i in 1:nrow(feature_summary)) {
+  #mx_i <- 21
+  mx_col <- feature_summary$feature[mx_i]
+  print(mx_col)
+  # mx_col <- "L0_S10_F233"
+  if (mx_col %in% mx_cols) {
+    feature_summary$coundDiffVals[mx_i] <- length(unique(dta_train.cat[, mx_col, with = F]))
+    mx_tmp <- as.data.frame(dta_train.cat[, list(N = .N/nrow(dta_train.cat)), by = mx_col])
+    colnames(mx_tmp)[1] <- "val"
+    mx_val <- merge(mx_val, mx_tmp, by = "val", all = T)
+    colnames(mx_val)[ncol(mx_val)] <- mx_col
+    
+    mx_tmp <- as.data.frame(dta_train.cat[isTrain==1, list(N = sum(Response)/nrow(dta_train.cat)), by = mx_col])
+    colnames(mx_tmp)[1] <- "val"
+    mx_val.1 <- merge(mx_val.1, mx_tmp, by = "val", all = T)
+    colnames(mx_val.1)[ncol(mx_val.1)] <- mx_col
+  }
+}
+write.csv(feature_summary, paste(dir_data, "feat_summary_cat.csv", sep = ""), quote = F, row.names = F)
+#
+mx_val$total <- apply(mx_val[, -1], 1, FUN = function(x) {sum(x, na.rm = T)})
+mx_val <- mx_val[order(-mx_val$total), ]
+mx_val[, c("val", "total")]
+plot(mx_val$total[-1], type = "h")
+
+# create a dictionary: categorical value of type string - numeric value
+mx_val$val.num <- 0:(nrow(mx_val)-1)
+mx_val$val.num[is.na(mx_val$val)] <- -999 # NA = 999
+dict_catval <- mx_val[, c("val", "val.num")]
+head(dict_catval)
+write.csv(dict_catval, paste(dir_data, "dict_catval.csv", sep = ""), quote = F, row.names = F)
+
+# EDA: 
+mx_val.1$total <- 0 # mx_val$total
+mx_val.1$total.max <- apply(mx_val.1[, -1], 1, FUN = function(x) {max(x, na.rm = T)})
+mx_val.1$total.mean <- apply(mx_val.1[, -1], 1, FUN = function(x) {mean(x, na.rm = T)})
+mx_val.1$total.min <- apply(mx_val.1[, -1], 1, FUN = function(x) {min(x, na.rm = T)})
+mx_val.1 <- mx_val.1[order(-mx_val.1$total), ]
+plot(zoo(mx_val.1[1:10, c("total.min", "total.mean", "total.max")]), type = "l", screens = 1, 
+     col = c("grey", "black", "grey"), ylab = "")
+abline(h = 0.0058, col = "red")
+# products with categorical label have lower error rate
+}
+
+
+# load dictionary
+dict_catval <- fread(paste(dir_data, "dict_catval.csv", sep = ""))
+summary(dict_catval)
+
+# this takes loooooong ~20min
+dta_train.cat[is.na(dta_train.cat)] <- -999
+for (i in 2:nrow(dict_catval)) {
+  dta_train.cat[dta_train.cat == dict_catval$val[i]] <- dict_catval$val.num[i]
+  print(round(i/nrow(dict_catval), 2))
+}
+gc()
+
+summary(as.factor(dta_train.cat$L0_S1_F25))
+summary(dta_train.cat$L0_S1_F25)
+
+
+cols.cat <- setdiff(colnames(dta_train.cat), "isTrain")
+
+# write out categorical data to reduced file - numeric  # ~ 1s
+fwrite(dta_train.cat[isTrain == 1, cols.cat, with=F], 
+       paste(dir_out.reduced, "train_categoricalnum.csv", sep = ""), quote = F)
+
+fwrite(dta_train.cat[isTrain == 0, cols.cat, with=F], 
+       paste(dir_out.reduced, "test_categoricalnum.csv", sep = ""), quote = F)
+
+
+# rm(dta_train.cat); gc()
+dta_train.cat <- fread(paste(dir_out.reduced, "train_categoricalnum.csv", sep = ""), 
+                       header = T, sep = ",")
+
+
+
+
+```
+\
+```{r}
+
+```
+
+
+\
+##numeric
+- eliminate duplicates for station
+- reduce highly correlated columns   
+- reduce constant and almost constant columns
+```{r num}
+
+# eliminate duplicates for station  
+# ***********************************************************************************************
+isDo <- F
+if (isDo) {
+  cols.num <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), nrows = 0, header = T)  
+  cols.num <- colnames(cols.num)
+
+  n_batch  <- 5
+  col_idx  <- c(1:length(cols.num))
+  col_bat  <- cut(col_idx, n_batch, labels = c(1:n_batch))
+
+  all_features <- vector("list", n_batch)
+  all_digests  <- vector("list", n_batch)
+  all_isNA  <- vector("list", n_batch)
+
+  for(i in seq_along(all_features)) {
+  print(i)
+  dt <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""),
+              #colClasses = "integer", na.strings = "", 
+              showProgress = F, select = col_idx[col_bat == i])
+  all_features[[i]] <- names(dt)
+  all_digests[[i]]  <- lapply(dt, digest)
+  all_isNA[[i]]  <- lapply(dt, FUN=function(x){mean(is.na(x))})
+  rm(dt)
+  }
+
+  feature_summary <- data.table(feature = unlist(all_features), 
+                              digest  = unlist(all_digests), 
+                              isNA = unlist(all_isNA))
+  feature_summary$duplicate <- duplicated(feature_summary$digest)
+
+  write.csv(feature_summary, paste(dir_data, "feat_summary_num.csv", sep = ""), quote = F, row.names = F)
+}
+
+feature_summary <- fread(paste(dir_data, "feat_summary_num.csv", sep = ""), sep = ",")
+feature_summary[, list(all = .N, dup = sum(duplicate), isNA = sum(isNA == 1), uniq = sum(!duplicate))]
+feature_summary[duplicate == T | isNA == 1, ]
+
+cols.num.uniq <- feature_summary[!duplicate & isNA < 1, feature]
+# reduced by:
+1 - length(cols.num.uniq)/nrow(feature_summary)
+
+# read numeric
+cols.num <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), nrows = 0, header = T)  
+colnames(cols.num)
+dta_train.num <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), 
+                       sep = ",", header = T,
+                       select = cols.num.uniq)
+
+
+# reduce highly correlated columns
+# ***********************************************************************************************
+if (isDo) {
+cor_cutoff <- c(0.80, 0.90, 0.95, 0.98, 0.99)
+# how many stations
+cols.num.mod <- feature_summary$feature[grep("_S", feature_summary$feature)]
+mx_x1 <- regexpr("_S", cols.num.mod)[1:length(cols.num.mod)]
+mx_x2 <- regexpr("_F", cols.num.mod)[1:length(cols.num.mod)]
+mx_stations <- unique(substr(cols.num.mod, mx_x1, mx_x2))
+mx_stations
+
+mx_cols.high.cor <- vector("list", length(cor_cutoff))
+
+for (mx_i in 1:length(mx_stations)) {
+  # mx_i <- 25
+  mx_s <- mx_stations[mx_i]
+  mx_cols <- colnames(dta_train.num)[grep(mx_s, colnames(dta_train.num))]
+  if (length(mx_cols) < 2) { next }
+  cor.table <- stats::cor(dta_train.num[, mx_cols, with = F], use = "pairwise.complete.obs")
+  corrplot(round(cor.table, 2), method="number", type = "lower", title = mx_s)
+  cor.table[is.na(cor.table)] <- 0
+  
+  for (i_c in 1:length(cor_cutoff)) {
+    high.cor.cols <- findCorrelation(cor.table, cor_cutoff[i_c], names = T)
+    if (length(high.cor.cols) > 0) {
+      mx_cols.high.cor[[i_c]] <- unique(c(mx_cols.high.cor[[i_c]], high.cor.cols)) 
+    }
+  }
+}
+#
+feature_summary <- as.data.frame(feature_summary)
+
+for (i_c in 1:length(cor_cutoff)) {
+  feature_summary[, paste("cor_", round(100*cor_cutoff[i_c]), sep = "")] <- 
+    (feature_summary$feature %in% mx_cols.high.cor[[i_c]])*1
+}
+feature_summary <- as.data.table(feature_summary)
+write.csv(feature_summary, paste(dir_data, "feat_summary_num.csv", sep = ""), quote = F, row.names = F)
+}
+
+# columns to keep
+cols.num.uniq <- feature_summary[!duplicate & isNA < 1 & cor_90 == 0, feature]
+
+# reduced by:
+1 - length(cols.num.uniq)/nrow(feature_summary)
+# 0.40
+
+
+# reduce constant and almost constant columns
+# ***********************************************************************************************
+if (isDo) {
+# columns were identified manually and by GBM on raw data
+mx_cols.const <- c("L0_S2_F52", "L0_S3_F88", "L0_S14_F378", "L0_S15_F409", "L0_S20_F466", "L1_S24_F761",
+                   "L1_S25_F2059", "L3_S31_F3838", "L3_S42_F4047", "L3_S46_D4135")
+# is constant column
+feature_summary[, isConst := (feature %in% mx_cols.const)*1]
+write.csv(feature_summary, paste(dir_data, "feat_summary_num.csv", sep = ""), quote = F, row.names = F)
+}
+
+# columns to keep
+cols.num.uniq <- feature_summary[!duplicate & isNA < 1 & cor_90 == 0 & isConst == 0, feature]
+
+# reduced by:
+1 - length(cols.num.uniq)/nrow(feature_summary)
+# 0.4072165
+
+# **********************************************************************************
+# reduce data.table, keep non corr and unique clumns
+dta_train.num <- dta_train.num[, cols.num.uniq, with = F]
+gc()
+# write data to reduced file
+fwrite(dta_train.num, paste(dir_out.reduced, "train_numeric.csv", sep = ""), quote = F)
+# fucking fast!!!
+
+dim(dta_train.num)
+summary(dta_train.num)
+
+# read numeric data
+#rm(dta_train.num); gc()
+dta_train.num <- fread(paste(dir_out.reduced, "train_numeric.csv", sep = ""), sep = ",", header = T)
+
+
+# **********************************************************************************
+# reduce test data
+dta_train.num <- fread(paste(dir_out.reduced, "train_numeric.csv", sep=""), 
+                       sep = ",", header = T, nrows = 5)
+cols.num.uniq <- colnames(dta_train.num)
+cols.num.uniq <- setdiff(cols.num.uniq, "Response")
+dta_train.num <- fread(paste(dir_data.raw, "test_numeric.csv", sep = ""), 
+                       sep = ",", header = T, select = cols.num.uniq)
+fwrite(dta_train.num, paste(dir_out.reduced, "test_numeric.csv", sep = ""), quote = F)
+
+```
+\
+##date
+- eliminate duplicates for station   
+- keep only one or several non-redundant date columns for station   
+```{r date}
+isDo <- T
+dir_in <- paste(dir_data.raw, "train_date.csv", sep = "")
+dir_in.test <- paste(dir_data.raw, "test_date.csv", sep = "")
+dir_out <- paste(dir_data, "feat_summary_date.csv", sep = "")
+
+# reduce duplicate and all-NA columns
+# ************************************************************************************
+if (isDo) {
+  cols.date <- fread(dir_in, nrows = 0, header = T)  
+  cols.date <- colnames(cols.date)
+
+  n_batch  <- 5
+  col_idx  <- c(1:length(cols.date))
+  col_bat  <- cut(col_idx, n_batch, labels = c(1:n_batch))
+
+  all_features <- vector("list", n_batch)
+  all_digests  <- vector("list", n_batch)
+  all_isNA  <- vector("list", n_batch)
+
+  for(i in seq_along(all_features)) {
+    print(i)
+    dt <- fread(dir_in, showProgress = F, select = col_idx[col_bat == i])
+    all_features[[i]] <- names(dt)
+    all_digests[[i]]  <- lapply(dt, digest)
+    all_isNA[[i]]  <- lapply(dt, FUN=function(x){mean(is.na(x))})
+    rm(dt)
+  }
+
+  feature_summary <- data.table(feature = unlist(all_features), 
+                              digest  = unlist(all_digests), 
+                              isNA = unlist(all_isNA))
+  feature_summary$duplicate <- duplicated(feature_summary$digest)
+
+  write.csv(feature_summary, dir_out, quote = F, row.names = F)
+}
+
+# read feat summary
+feature_summary <- fread(dir_out, sep = ",")
+cols.date.uniq <- feature_summary[!duplicate & isNA < 1, feature]
+feature_summary[, list(featsCount = .N, dups = sum(duplicate), nondups = sum(!duplicate), 
+                       perc.dups = sum(duplicate)/.N, NAs = sum(isNA==1))]
+head(feature_summary[duplicate == T, ], 5)
+head(feature_summary, 5)
+
+# how many stations
+cols.date.mod <- feature_summary$feature[grep("_S", feature_summary$feature)]
+mx_x1 <- regexpr("_S", cols.date.mod)[1:length(cols.date.mod)]
+mx_x2 <- regexpr("_D", cols.date.mod)[1:length(cols.date.mod)]
+mx_stations <- unique(substr(cols.date.mod, mx_x1, mx_x2))
+mx_stations
+length(mx_stations)
+
+# read date data again, only non-dup columns
+rm(dta_train.date); gc()
+#dta_train.date <- fread(dir_in, sep = ",", header = T)
+dta_train.date <- fread(dir_in, 
+                        sep = ",", header = T, 
+                        select = cols.date.uniq) 
+dim(dta_train.date)
+colnames(dta_train.date)
+
+# append Response to date data
+dta_train.num <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), 
+                       sep = ",", header = T,
+                       select = c("Id", "Response"))
+dta_train.date$Response <- dta_train.num$Response
+
+
+if (F) {
+# add the minimum date for product
+cols.date.L <- (colnames(dta_train.date))[grep("L", (colnames(dta_train.date)))]
+udf_colMax(dta_train.date, cols.date.L)
+udf_colMin(dta_train.date, cols.date.L)
+
+dta_train.date[, date_min := mx_min]
+dta_train.date[, date_max := mx_max]
+
+dta_train.date[, list(isInf = sum(is.infinite(date_min)), isNA = sum(is.na(date_min)))] #582
+dta_train.date[, list(isInf = sum(is.infinite(date_max)), isNA = sum(is.na(date_max)))] 
+
+# replace NA with zero
+dta_train.date[is.infinite(date_min) | is.na(date_min), date_min := 0]
+dta_train.date[is.infinite(date_max) | is.na(date_max), date_max := 0]
+}
+
+
+# reduce columns identical when having values, over write next column to first column of station
+# **************************************************************************************************
+# still some duplicate columns left, identical where rows have values, different on NAs (one has NA, other has value)
+
+# example
+dta_train.date[, mx := L0_S1_D26 - L0_S1_D30]
+dta_train.date[, list(isNA = sum(is.na(mx))/.N, 
+                      isZero = sum(mx == 0, na.rm = T)/.N, 
+                      isDif = sum(mx != 0, na.rm = T)/.N, 
+                      col1_NAs = sum(is.na(L0_S1_D26))/.N,
+                      col2_NAs = sum(is.na(L0_S1_D30))/.N)]
+summary(dta_train.date$mx)
+dta_train.date[, mx:=NULL]
+
+# run digest again
+all_digests <- lapply(dta_train.date, digest)
+all_digests <- unlist(all_digests)
+feature_summary2 <- data.table(feature = names(all_digests), digest  = all_digests)
+feature_summary2$duplicate <- duplicated(feature_summary2$digest)
+summary(feature_summary2)
+# digest can't identify any duplicates
+
+
+# run a one-by-one comparison for each station
+if (T) {
+mx_i_dups <- c()
+for (mx_i_s in 1:length(mx_stations)) {
+  mx_cols <- cols.date.uniq[grep(mx_stations[mx_i_s], cols.date.uniq)]
+  if (length(mx_cols) == 0) {
+    print("stop! - no date for station?")
+    break
+    } else if (length(mx_cols) > 1) {
+      for (i1 in 1:(length(mx_cols)-1))
+      {
+        if (mx_cols[i1] %in% mx_i_dups) {next }
+        for (i2 in (i1+1):length(mx_cols))
+        {
+          if (mx_cols[i2] %in% mx_i_dups) {next }
+          print(paste(mx_cols[i1], mx_cols[i2]))
+          mx_sumdif <- sum(dta_train.date[, mx_cols[i1], with = F] - 
+                             dta_train.date[, mx_cols[i2], with = F], na.rm = T)
+          if (mx_sumdif == 0) {
+            mx_i_dups <- c(mx_i_dups, mx_cols[i2])
+            print(paste("dup:", mx_cols[i2]))
+            if (F) {
+              dta_train.date$mx1 <- dta_train.date[, mx_cols[i1], with = F]
+              dta_train.date$mx2 <- dta_train.date[, mx_cols[i2], with = F]
+              print(paste("overwritten NAs:", dta_train.date[, sum(!is.na(mx2) & is.na(mx1))]))
+              dta_train.date[!is.na(mx2) & is.na(mx1), mx1 := mx2]
+              dta_train.date[, mx_cols[i1]] <- dta_train.date[, mx1]
+            }
+          }
+        }
+      }
+    }
+}
+mx_i_dups
+cols.date.uniq <- setdiff(cols.date.uniq, mx_i_dups)
+cols.date.uniq
+
+# check: all stations present? (52 stations)
+cols.date.mod2 <- cols.date.uniq[grep("_S", cols.date.uniq)]
+mx_x1 <- regexpr("_S", cols.date.mod2)[1:length(cols.date.mod2)]
+mx_x2 <- regexpr("_D", cols.date.mod2)[1:length(cols.date.mod2)]
+mx_stations <- unique(substr(cols.date.mod2, mx_x1, mx_x2))
+mx_stations
+length(mx_stations) # 52
+# yes. all good.
+
+# keep only unique columns
+dta_train.date <- dta_train.date[, c(cols.date.uniq, "Response"), with = F]
+summary(dta_train.date)
+colnames(dta_train.date)
+}
+
+
+# manual check, reduce alike columns (same but shifted by a constant time units)
+# station 24, 25
+# ************************************************************************************
+# code to manually select date features to reduce
+if (F) {
+  dta_train.date[, d1 := L1_S25_D2780]
+  dta_train.date[, d2 := L1_S25_D3011]
+  dta_train.date[, list(isDif = sum(d1 != d2, na.rm = T)/.N,
+                      isEqual = sum(d1 == d2, na.rm = T)/.N,
+                      isNA1 = sum(is.na(d1))/.N,
+                      isNA2 = sum(is.na(d2))/.N,
+                      isNA1_notNA2 = sum(is.na(d1) & !is.na(d2))/.N,
+                      notNA1_isNA2 = sum(!is.na(d1) & is.na(d2))/.N)]
+  dta_train.date[d1 != d2, list(count = length(Id), meanResp = mean(Response))]
+  dta_train.date[(d1 - d2) < -0.10, list(count = length(Id), meanResp = mean(Response))]
+  udf_quantile(dta_train.date[d1 != d2, d1 - d2])
+}
+
+
+# ****
+mx_L1_S24_D677 <- c("L1_S24_D697", "L1_S24_D702", "L1_S24_D772", "L1_S24_D801", "L1_S24_D804", 
+                    "L1_S24_D807", "L1_S24_D813", "L1_S24_D818", "L1_S24_D909", "L1_S24_D999", 
+                    "L1_S24_D1018", "L1_S24_D1062")
+mx_cols <- mx_L1_S24_D677[mx_L1_S24_D677 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D677", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D677) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D677 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D677)
+cols.date.uniq
+
+
+# ****
+mx_L1_S24_D1116 <- c("L1_S24_D1135", "L1_S24_D1155", "L1_S24_D1158", "L1_S24_D1163", "L1_S24_D1168", 
+                     "L1_S24_D1171", "L1_S24_D1178", "L1_S24_D1186", "L1_S24_D1277", "L1_S24_D1368", 
+                     "L1_S24_D1413", "L1_S24_D1457")
+mx_cols <- mx_L1_S24_D1116[mx_L1_S24_D1116 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D1116", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D1116) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D1116 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D1116)
+cols.date.uniq
+
+
+# ****
+mx_L1_S24_D1511 <- c("L1_S24_D1522", "L1_S24_D1536", "L1_S24_D1558", "L1_S24_D1562", "L1_S24_D1566", 
+                     "L1_S24_D1568", "L1_S24_D1570", "L1_S24_D1576", "L1_S24_D1583", "L1_S24_D1674", 
+                     "L1_S24_D1765", "L1_S24_D1770", "L1_S24_D1809", "L1_S24_D1826")
+mx_cols <- mx_L1_S24_D1511[mx_L1_S24_D1511 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D1511", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D1511) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D1511 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D1511)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D1854 <- c("L1_S25_D1867", "L1_S25_D1883", "L1_S25_D1887", "L1_S25_D1891", "L1_S25_D1898", 
+                     "L1_S25_D1902", "L1_S25_D1980", "L1_S25_D2058", "L1_S25_D2098", "L1_S25_D2138", 
+                     "L1_S25_D2180", "L1_S25_D2206")
+mx_cols <- mx_L1_S25_D1854[mx_L1_S25_D1854 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S25_D1854", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D1854) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D1854 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D1854)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2230 <- c("L1_S25_D2238", "L1_S25_D2240", "L1_S25_D2242", "L1_S25_D2430", "L1_S25_D2248", 
+                     "L1_S25_D2251", "L1_S25_D2329", "L1_S25_D2406", "L1_S25_D2445", "L1_S25_D2471")
+mx_cols <- mx_L1_S25_D2230[mx_L1_S25_D2230 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2230", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2230) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2230 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2230)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2497 <- c("L1_S25_D2505", "L1_S25_D2507", "L1_S25_D2509", "L1_S25_D2515", "L1_S25_D2518", 
+                     "L1_S25_D2596",  "L1_S25_D2674", "L1_S25_D2713", "L1_S25_D2728", "L1_S25_D2754")
+mx_cols <- mx_L1_S25_D2497[mx_L1_S25_D2497 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2497", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2497) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2497 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2497)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2780 <- c("L1_S25_D2788", "L1_S25_D2790", "L1_S25_D2792", "L1_S25_D2798", "L1_S25_D2801", 
+                     "L1_S25_D2879", "L1_S25_D2957", "L1_S25_D2996", "L1_S25_D3011")
+mx_cols <- mx_L1_S25_D2780[mx_L1_S25_D2780 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2780", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2780) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2780 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2780)
+cols.date.uniq
+
+# reduced:
+1-(length(cols.date.uniq) - 1)/(nrow(feature_summary) - 1)
+# 0.950692
+
+# keep only non-redundant columns
+dta_train.date <- dta_train.date[, c(cols.date.uniq), with = F]
+summary(dta_train.date)
+colnames(dta_train.date)
+
+# write out reduced date data
+fwrite(dta_train.date, paste(dir_out.reduced, "train_date.csv", sep = ""), quote = F)
+
+gc()
+
+colnames(dta_train.date)
+
+
+
+# reduce test data
+# *************************************************************
+if (F) {
+  dir_in <- paste(dir_data.raw, "test_date.csv", sep = "")
+  feature_summary <- fread(dir_out, sep = ",")
+  cols.date.uniq <- feature_summary[!duplicate & isNA < 1, feature]
+  
+  mx_i_dups <- c("L0_S1_D30","L0_S4_D111","L0_S9_D157","L0_S9_D162","L0_S9_D167","L0_S10_D221","L0_S10_D231",
+  "L0_S21_D474","L0_S21_D484","L0_S22_D548","L0_S22_D553","L0_S22_D558","L1_S24_D1158","L1_S24_D1562",
+  "L1_S24_D702","L1_S24_D772","L1_S24_D1018","L1_S24_D1155","L1_S24_D1536","L1_S24_D1558","L1_S24_D1770",
+  "L1_S25_D2180","L1_S25_D2754","L1_S25_D2471","L1_S25_D2242","L1_S25_D2596","L1_S25_D2430","L1_S25_D2509",
+  "L1_S25_D2792","L2_S26_D3081","L3_S29_D3474","L3_S30_D3501","L3_S30_D3506","L3_S30_D3566","L3_S30_D3726",
+  "L3_S35_D3895","L3_S35_D3900","L3_S36_D3928","L3_S40_D3985","L3_S42_D4045","L3_S43_D4082","L3_S49_D4218")
+
+  cols.date.uniq <- setdiff(cols.date.uniq, mx_i_dups)
+  cols.date.uniq
+  dta_train.date <- fread(dir_in, sep = ",", header = T, select = cols.date.uniq) 
+}
+
+# ****
+mx_L1_S24_D677 <- c("L1_S24_D697", "L1_S24_D702", "L1_S24_D772", "L1_S24_D801", "L1_S24_D804", 
+                    "L1_S24_D807", "L1_S24_D813", "L1_S24_D818", "L1_S24_D909", "L1_S24_D999", 
+                    "L1_S24_D1018", "L1_S24_D1062")
+mx_cols <- mx_L1_S24_D677[mx_L1_S24_D677 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D677", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D677) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D677 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D677)
+cols.date.uniq
+
+
+# ****
+mx_L1_S24_D1116 <- c("L1_S24_D1135", "L1_S24_D1155", "L1_S24_D1158", "L1_S24_D1163", "L1_S24_D1168", 
+                     "L1_S24_D1171", "L1_S24_D1178", "L1_S24_D1186", "L1_S24_D1277", "L1_S24_D1368", 
+                     "L1_S24_D1413", "L1_S24_D1457")
+mx_cols <- mx_L1_S24_D1116[mx_L1_S24_D1116 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D1116", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D1116) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D1116 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D1116)
+cols.date.uniq
+
+
+# ****
+mx_L1_S24_D1511 <- c("L1_S24_D1522", "L1_S24_D1536", "L1_S24_D1558", "L1_S24_D1562", "L1_S24_D1566", 
+                     "L1_S24_D1568", "L1_S24_D1570", "L1_S24_D1576", "L1_S24_D1583", "L1_S24_D1674", 
+                     "L1_S24_D1765", "L1_S24_D1770", "L1_S24_D1809", "L1_S24_D1826")
+mx_cols <- mx_L1_S24_D1511[mx_L1_S24_D1511 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S24_D1511", mx_cols))
+if (dta_train.date[, sum(is.na(L1_S24_D1511) & !is.na(mx_min))] > 0) {
+  dta_train.date[, L1_S24_D1511 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S24_D1511)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D1854 <- c("L1_S25_D1867", "L1_S25_D1883", "L1_S25_D1887", "L1_S25_D1891", "L1_S25_D1898", 
+                     "L1_S25_D1902", "L1_S25_D1980", "L1_S25_D2058", "L1_S25_D2098", "L1_S25_D2138", 
+                     "L1_S25_D2180", "L1_S25_D2206")
+mx_cols <- mx_L1_S25_D1854[mx_L1_S25_D1854 %in% colnames(dta_train.date)]
+
+udf_colMin(dta_train.date, c("L1_S25_D1854", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D1854) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D1854 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D1854)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2230 <- c("L1_S25_D2238", "L1_S25_D2240", "L1_S25_D2242", "L1_S25_D2430", "L1_S25_D2248", 
+                     "L1_S25_D2251", "L1_S25_D2329", "L1_S25_D2406", "L1_S25_D2445", "L1_S25_D2471")
+mx_cols <- mx_L1_S25_D2230[mx_L1_S25_D2230 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2230", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2230) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2230 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2230)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2497 <- c("L1_S25_D2505", "L1_S25_D2507", "L1_S25_D2509", "L1_S25_D2515", "L1_S25_D2518", 
+                     "L1_S25_D2596",  "L1_S25_D2674", "L1_S25_D2713", "L1_S25_D2728", "L1_S25_D2754")
+mx_cols <- mx_L1_S25_D2497[mx_L1_S25_D2497 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2497", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2497) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2497 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2497)
+cols.date.uniq
+
+
+# ****
+mx_L1_S25_D2780 <- c("L1_S25_D2788", "L1_S25_D2790", "L1_S25_D2792", "L1_S25_D2798", "L1_S25_D2801", 
+                     "L1_S25_D2879", "L1_S25_D2957", "L1_S25_D2996", "L1_S25_D3011")
+mx_cols <- mx_L1_S25_D2780[mx_L1_S25_D2780 %in% colnames(dta_train.date)]
+udf_colMin(dta_train.date, c("L1_S25_D2780", mx_cols))
+mx_check <- dta_train.date[, sum(is.na(L1_S25_D2780) & !is.na(mx_min))]; mx_check
+if (mx_check > 0) {
+  dta_train.date[, L1_S25_D2780 := mx_min]
+}
+cols.date.uniq <- setdiff(cols.date.uniq, mx_L1_S25_D2780)
+cols.date.uniq
+
+# reduced:
+1-(length(cols.date.uniq) - 1)/(nrow(feature_summary) - 1)
+# 0.950692
+
+# keep only non-redundant columns
+dta_train.date <- dta_train.date[, c(cols.date.uniq), with = F]
+summary(dta_train.date)
+colnames(dta_train.date)
+
+# write out reduced date data
+fwrite(dta_train.date, paste(dir_out.reduced, "test_date.csv", sep = ""), quote = F)
+
+# *************************************************************
+
+```
+\
+summary of reduced columns
+```{r}
+
+mx_train.num.raw <- fread(paste(dir_data.raw, "train_numeric.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.num.red <- fread(paste(dir_out.reduced, "train_numeric.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.num.raw <- colnames(mx_train.num.raw)
+mx_train.num.red <- colnames(mx_train.num.red)
+
+
+mx_train.cat.raw <- fread(paste(dir_data.raw, "train_categorical.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.cat.red <- fread(paste(dir_out.reduced, "train_categorical.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.cat.raw <- colnames(mx_train.cat.raw)
+mx_train.cat.red <- colnames(mx_train.cat.red)
+
+mx_train.date.raw <- fread(paste(dir_data.raw, "train_date.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.date.red <- fread(paste(dir_out.reduced, "train_date.csv", sep = ""), 
+                       sep = ",", header = T, nrows = 0)
+mx_train.date.raw <- colnames(mx_train.date.raw)
+mx_train.date.red <- colnames(mx_train.date.red)
+
+# reduced by:
+1 - length(c(mx_train.num.red, mx_train.cat.red, mx_train.date.red))/length(c(mx_train.num.raw, mx_train.cat.raw, mx_train.date.raw))
+
+# # of raw columns
+length(unique(c(mx_train.num.raw, mx_train.cat.raw, mx_train.date.raw)))
+
+# # of kept columns
+length(unique(c(mx_train.num.red, mx_train.cat.red, mx_train.date.red)))
+
+length(mx_train.num.red)
+length(mx_train.cat.red)
+length(mx_train.date.red)
+
+```
+
